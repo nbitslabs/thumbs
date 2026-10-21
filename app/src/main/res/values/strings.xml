@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Thumbs</string>
+    <string name="a11y_label">Thumbs remote control</string>
+    <string name="a11y_summary">Lets your authorised AI agents see and control this phone over Tailscale.</string>
+    <string name="a11y_description">Thumbs runs an authenticated MCP server so agents on your own computers (Claude, Codex, Hermes…) can read the screen and perform touches, typing and navigation on this phone. It only accepts connections carrying an API key you created in the Thumbs app, and by default only over Tailscale. Everything an agent does is listed in the app\'s activity log, and the server can be stopped from its notification at any time.</string>
+    <string name="channel_server">MCP server</string>
+    <string name="channel_server_description">Shown while the Thumbs server is running</string>
+    <string name="notification_title">Thumbs server running</string>
+    <string name="notification_title_active">Agent controlling this phone</string>
+    <string name="notification_listening">Listening on %1$s</string>
+    <string name="notification_listening_no_tailscale">Port %1$d · Tailscale not connected</string>
+    <string name="notification_active">Key \"%1$s\" is making requests</string>
+    <string name="stop">Stop</string>
+</resources>
