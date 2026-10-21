@@ -1,0 +1,111 @@
+# Thumbs
+
+Thumbs turns an Android phone into an authenticated [MCP](https://modelcontextprotocol.io) server, so AI agents on your own computers (Claude Code, Codex, Hermes, anything that speaks MCP over HTTP) can see and control the phone over Tailscale.
+
+It runs entirely on the phone: an accessibility service does the seeing and touching, and a small HTTP server exposes it as MCP tools. No adb, USB cable or computer-side daemon is needed.
+
+## How it works
+
+- **Accessibility service.** Reads the UI tree, takes screenshots (`AccessibilityService.takeScreenshot`), dispatches gestures, performs global actions (back/home/recents/notifications…), and on Android 13+ acts as an input method for the focused field so typing is real IME input (unicode, emoji, key chords).
+- **Notification listener** (optional). Lists, opens, acts on, replies to and dismisses notifications.
+- **Foreground service.** Hosts the MCP server (Streamable HTTP, `POST /mcp`, JSON responses) on port 8765. Its notification shows when an agent is active and has a Stop button.
+
+## Security model
+
+- **API keys.** Every request needs `Authorization: Bearer thumbs_…`. Create one key per computer or agent in the app; each key is either *Full control* or *Read only* (screen, UI tree, device state, notifications). Keys are 256-bit random tokens shown once; only their SHA-256 is stored, and they are excluded from backups. Revoking a key takes effect immediately.
+- **Network.** By default only Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback (for `adb forward`) are accepted. Tailscale encrypts the traffic (WireGuard), which is why plain HTTP is used. "Any network" can be enabled in settings; a key is still required.
+- **Browsers are rejected.** Requests carrying an `Origin` header are refused, which blocks DNS-rebinding attacks from web pages.
+- **Brute force.** An address is locked out for 5 minutes after 10 failed authentications.
+- **The Thumbs app is off-limits to agents.** Agents can't see it in the UI tree or screenshots (`FLAG_SECURE`), operate it, or launch it. This stops an agent from minting itself new keys or widening network access.
+- **Audit.** The app shows a log of every tool call, with the key, arguments and result. Arguments that may hold typed text, URLs or replies are not recorded.
+- **Agent instructions.** The MCP `instructions` tell agents never to enter PINs, passwords or 2FA codes, to ask the user to unlock a secure lock screen, and to confirm before sending, buying, deleting or changing security settings.
+
+## Tools
+
+| Area | Tools |
+| --- | --- |
+| Observe (read-only keys) | `get_device_state`, `screenshot`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
+| Touch | `tap`, `long_press`, `double_tap`, `swipe`, `scroll`, `drag`, `pinch`, `element_action` |
+| Text & keys | `type_text`, `press_key`, `set_clipboard`, `get_clipboard` |
+| Apps | `open_app`, `open_url`, `start_intent` |
+| Notifications | `open_notification`, `notification_action` (including inline replies), `dismiss_notification` |
+| Power | `wake_screen` (`press_key lock_screen` locks) |
+
+Conventions:
+
+- **Coordinates.** All coordinates share one space: the screen scaled to fit vision-model input limits (e.g. 706×1568 for a 1080×2400 phone). Screenshots come back at exactly that size, so any point in a screenshot can be tapped directly. `get_device_state` reports the mapping.
+- **Element refs.** `get_ui_tree` lists elements as `[e12] Button "OK" {clickable} @left,top,right,bottom`. Refs stay valid while the element is on screen, and most tools accept `ref`, `text` or `x`/`y` as the target.
+- **Settling.** Control tools wait for the UI to settle, and accept `observe: "tree" | "screenshot" | "both"` to return the new state in the same call.
+- **Directions.** For `scroll`, the direction is the content to reveal (`down` shows what's below), and it reports when the end has been reached. For `swipe`, the direction is finger motion, as a fast flick.
+
+## Phone setup
+
+1. Install Tailscale on the phone and connect it to your tailnet. In Android settings, set both Tailscale and Thumbs to **Unrestricted** battery usage; otherwise Doze cuts their network access while the phone is idle.
+2. Install Thumbs: `adb install app-debug.apk`, or build it yourself (see Development).
+3. Open Thumbs and work through the setup card:
+   - **Accessibility service.** If you installed the APK through a browser or file manager, Android 13+ greys out the toggle. Go to App info → ⋮ → *Allow restricted settings* first. Installing with `adb` avoids this.
+   - **Notification access** (optional), **unrestricted battery**, and the **status notification**.
+4. Create an API key. The dialog shows the token once, together with ready-to-paste configuration.
+
+## Connecting agents
+
+Use the phone's Tailscale IP or MagicDNS name, which the app shows as the MCP endpoint.
+
+Claude Code:
+
+```sh
+claude mcp add --transport http thumbs http://<phone>:8765/mcp --header "Authorization: Bearer thumbs_…"
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.thumbs]
+url = "http://<phone>:8765/mcp"
+http_headers = { "Authorization" = "Bearer thumbs_…" }
+```
+
+Generic JSON (Hermes and others):
+
+```json
+{ "mcpServers": { "thumbs": { "type": "http", "url": "http://<phone>:8765/mcp", "headers": { "Authorization": "Bearer thumbs_…" } } } }
+```
+
+For quick checks from a shell, use `scripts/mcp_call.py`, which only needs the Python standard library:
+
+```sh
+export THUMBS_URL=http://<phone>:8765/mcp THUMBS_TOKEN=thumbs_…
+scripts/mcp_call.py list
+scripts/mcp_call.py get_ui_tree
+scripts/mcp_call.py tap '{"text": "Settings"}'
+scripts/mcp_call.py screenshot --image /tmp/screen.jpg
+```
+
+## Development
+
+The dev shell (`nix develop`, or direnv with devenv) provides the JDK, Kotlin, Gradle and the Android SDK, including emulator system images.
+
+```sh
+./gradlew :app:assembleDebug :app:testDebugUnitTest
+```
+
+Emulator workflow:
+
+```sh
+avdmanager create avd -n thumbs36 -k "system-images;android-36;google_apis_playstore;arm64-v8a" -d pixel_7
+emulator -avd thumbs36 -no-window -no-audio &
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell settings put secure enabled_accessibility_services com.nbitslabs.thumbs/.a11y.ThumbsAccessibilityService
+adb shell cmd notification allow_listener com.nbitslabs.thumbs/com.nbitslabs.thumbs.device.NotificationListener
+adb forward tcp:8765 tcp:8765   # loopback is always allowed
+```
+
+Then create a key in the app and point a client at `http://127.0.0.1:8765/mcp`.
+
+## Known limitations
+
+- **Secure lock screen.** Agents can't get past a PIN, pattern or password lock (by design). `wake_screen` turns the screen on and dismisses swipe-only lock screens.
+- **FLAG_SECURE apps.** Screenshots of banking apps, password prompts and similar screens come back black. The UI tree usually still works.
+- **Key events.** Keyboard keys (enter, tab, ctrl+…) are delivered to the focused text field. Arbitrary key events can't be injected into other views without root.
+- **Clipboard reads.** Reading the clipboard only works while a text field is focused (Android restricts background clipboard access).
+- **Games and canvas apps.** Apps that render without accessibility information (games, some Flutter/canvas apps) can only be driven by screenshot and coordinates.

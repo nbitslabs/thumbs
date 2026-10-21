@@ -43,10 +43,12 @@ class ThumbsApp : Application() {
         if (settings.serverEnabled.value) startServer()
     }
 
-    fun startServer() {
+    fun startServer(restart: Boolean = false) {
         settings.setServerEnabled(true)
         try {
-            startForegroundService(Intent(this, ServerService::class.java))
+            val intent = Intent(this, ServerService::class.java)
+            if (restart) intent.action = ServerService.ACTION_RESTART
+            startForegroundService(intent)
         } catch (e: Exception) {
             // Background FGS starts can be refused (e.g. some OEMs); the UI can start it later
             Log.w(TAG, "Couldn't start server service", e)
@@ -59,9 +61,9 @@ class ThumbsApp : Application() {
         stopService(Intent(this, ServerService::class.java))
     }
 
+    /** Rebinds the listener, e.g. after a port change. */
     fun restartServer() {
-        stopService(Intent(this, ServerService::class.java))
-        startServerIfEnabled()
+        if (settings.serverEnabled.value) startServer(restart = true)
     }
 
     companion object {

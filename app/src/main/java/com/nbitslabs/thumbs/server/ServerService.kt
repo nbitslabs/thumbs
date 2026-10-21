@@ -49,6 +49,10 @@ class ServerService : LifecycleService() {
             return START_NOT_STICKY
         }
         startForeground(NOTIFICATION_ID, notification(null), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        if (intent?.action == ACTION_RESTART) {
+            server?.stop()
+            server = null
+        }
         if (server == null) startServer(app)
         return START_STICKY
     }
@@ -126,6 +130,7 @@ class ServerService : LifecycleService() {
         private const val CHANNEL = "server"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "com.nbitslabs.thumbs.STOP"
+        const val ACTION_RESTART = "com.nbitslabs.thumbs.RESTART"
         private const val ACTIVE_WINDOW_MS = 15_000L
     }
 }
