@@ -78,8 +78,10 @@ class ThumbsAccessibilityService : AccessibilityService() {
     }
 
     private fun clearInstance() {
-        if (instance === this) instance = null
-        _connected.value = false
+        if (instance === this) {
+            instance = null
+            _connected.value = false
+        }
     }
 
     // --- Windows ---------------------------------------------------------------------------
@@ -108,9 +110,12 @@ class ThumbsAccessibilityService : AccessibilityService() {
 
     /** Waits until no UI-change events arrive for [quietMs], up to [timeoutMs]. Returns true if it settled. */
     suspend fun waitForIdle(quietMs: Long = 400, timeoutMs: Long = 2000): Boolean {
-        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        val start = SystemClock.uptimeMillis()
+        val deadline = start + timeoutMs
         while (SystemClock.uptimeMillis() < deadline) {
-            val since = SystemClock.uptimeMillis() - lastUiEventAt
+            // Measure from the later of the last event and the start of the wait, so a screen
+            // that was quiet *before* an action doesn't count as settled right after it
+            val since = SystemClock.uptimeMillis() - maxOf(lastUiEventAt, start)
             if (since >= quietMs) return true
             delay((quietMs - since).coerceIn(20, 100))
         }

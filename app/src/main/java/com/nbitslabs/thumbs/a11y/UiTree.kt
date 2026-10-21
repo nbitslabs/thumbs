@@ -75,7 +75,7 @@ object UiTree {
         }
 
         if (windows.isEmpty()) {
-            service.rootInActiveWindow?.let {
+            service.rootInActiveWindow?.takeIf { it.packageName?.toString() != service.packageName }?.let {
                 sb.append("## window app=${it.packageName}\n")
                 walk(it, 0)
             }
@@ -83,6 +83,10 @@ object UiTree {
             for (w in windows) {
                 if (!options.includeSystemWindows && w.type != AccessibilityWindowInfo.TYPE_APPLICATION && w.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
                 val root = w.root ?: continue
+                if (root.packageName?.toString() == service.packageName) {
+                    sb.append("## window app=").append(service.packageName).append(" (hidden: the Thumbs app can only be used by the person holding the phone)\n")
+                    continue
+                }
                 sb.append("## window ").append(windowType(w.type))
                 root.packageName?.let { sb.append(" app=").append(it) }
                 w.title?.takeIf { it.isNotBlank() }?.let { sb.append(" title=\"").append(clip(it.toString(), 60)).append('"') }
@@ -140,6 +144,7 @@ object UiTree {
     /** All visible nodes across windows, top-most window first. */
     fun allNodes(service: ThumbsAccessibilityService, includeInvisible: Boolean = false): Sequence<AccessibilityNodeInfo> = sequence {
         for (root in service.roots()) {
+            if (root.packageName?.toString() == service.packageName) continue
             val stack = ArrayDeque<AccessibilityNodeInfo>()
             stack.addLast(root)
             while (stack.isNotEmpty()) {

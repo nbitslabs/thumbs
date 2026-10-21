@@ -428,6 +428,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         ) { call ->
             val svc = ready()
             val app = Apps.resolve(context, call.requireString("name"))
+            if (app.packageName == context.packageName) throw ToolException("Agents can't open the Thumbs app.")
             withContext(Dispatchers.Main) { Apps.launch(svc, app, call.bool("fresh") == true) }
             val deadline = SystemClock.uptimeMillis() + 8000
             while (svc.currentPackage() != app.packageName && SystemClock.uptimeMillis() < deadline) delay(150)
@@ -468,6 +469,9 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             destructive = true,
         ) { call ->
             val svc = ready()
+            if (listOfNotNull(call.string("package"), call.string("component"), call.string("data")).any { it.contains(context.packageName) }) {
+                throw ToolException("Agents can't open the Thumbs app.")
+            }
             val extras = call.obj("extras")?.mapValues { (it.value as? kotlinx.serialization.json.JsonPrimitive)?.content ?: it.value.toString() } ?: emptyMap()
             val started = withContext(Dispatchers.Main) {
                 Apps.startIntent(svc, call.string("action"), call.string("data"), call.string("type"), call.string("package"), call.string("component"), call.stringList("categories") ?: emptyList(), extras)
@@ -585,9 +589,17 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
     private fun boundsOf(node: AccessibilityNodeInfo) = Rect().also { node.getBoundsInScreen(it) }
     private fun center(node: AccessibilityNodeInfo): PointF = boundsOf(node).let { PointF(it.exactCenterX(), it.exactCenterY()) }
 
-    /** Ensures the service is connected and the screen is on before driving the UI. */
-    private suspend fun ready(): ThumbsAccessibilityService {
+    /**
+     * Ensures the service is connected and the screen is on before driving the UI.
+     *
+     * Agents may never operate the Thumbs app itself: from there they could mint API keys or
+     * widen network access. Only system navigation (home/back/…) is allowed to leave it.
+     */
+    private suspend fun ready(allowOwnApp: Boolean = false): ThumbsAccessibilityService {
         val svc = ThumbsAccessibilityService.require()
+        if (!allowOwnApp && svc.currentPackage() == context.packageName) {
+            throw ToolException("The Thumbs app is in front. For security, agents can't operate it; press_key home/back or open another app first.")
+        }
         if (!DeviceState.isScreenOn(context)) {
             if (!autoWake()) throw ToolException("The screen is off. Call wake_screen first.")
             DeviceState.wake(svc)
@@ -613,7 +625,10 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         val content = mutableListOf<Content>(Content.Text("$message\n${header(svc)}"))
         when (call.string("observe") ?: "none") {
             "tree" -> content += Content.Text(UiTree.snapshot(svc, space()).text)
-            "screenshot" -> content += screenshotContent(svc, "jpeg", 75)
+            "screenshot" -> {
+                delay(250)
+                content += screenshotContent(svc, "jpeg", 75)
+            }
             "both" -> {
                 content += Content.Text(UiTree.snapshot(svc, space()).text)
                 content += screenshotContent(svc, "jpeg", 75)
@@ -622,18 +637,33 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         return ToolResult(content)
     }
 
-    private suspend fun screenshotContent(svc: ThumbsAccessibilityService, format: String, quality: Int): Content.Image {
+    private suspend fun screenshotContent(svc: ThumbsAccessibilityService, format: String, quality: Int): List<Content> {
         val raw = svc.screenshot()
         return withContext(Dispatchers.Default) {
             val sp = CoordinateSpace.forScreen(raw.width, raw.height)
             val scaled = if (sp.scale < 1.0) Bitmap.createScaledBitmap(raw, sp.width, sp.height, true) else raw
+            val black = isBlank(scaled)
             val out = ByteArrayOutputStream()
             val png = format == "png"
             scaled.compress(if (png) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 100), out)
             if (scaled !== raw) scaled.recycle()
             raw.recycle()
-            Content.Image(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP), if (png) "image/png" else "image/jpeg")
+            listOfNotNull(
+                Content.Image(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP), if (png) "image/png" else "image/jpeg"),
+                if (black) Content.Text("Note: the screenshot is black. The screen is off, or the app in front blocks capture (FLAG_SECURE, e.g. banking or password screens); get_ui_tree still works there.") else null,
+            )
         }
+    }
+
+    /** True when (nearly) every sampled pixel is black. */
+    private fun isBlank(b: Bitmap): Boolean {
+        val stepX = maxOf(1, b.width / 24)
+        val stepY = maxOf(1, b.height / 48)
+        for (y in 0 until b.height step stepY) for (x in 0 until b.width step stepX) {
+            val c = b.getPixel(x, y)
+            if ((c shr 16 and 0xff) + (c shr 8 and 0xff) + (c and 0xff) > 24) return false
+        }
+        return true
     }
 
     /** Start/end points for a finger moving in [dir] across [region] (screen px). */
@@ -717,7 +747,10 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
                 UiTree.find(svc, q).firstOrNull { it.isEditable } ?: UiTree.find(svc, q).firstOrNull()
                     ?: throw ToolException("No field matches '$q'.")
             }
-        if (fieldNode != null && !fieldNode.isFocused) {
+        if (fieldNode == null) {
+            // The field may still be appearing (e.g. a search screen opening after a tap)
+            awaitFocusedField(svc, input, 2000)
+        } else if (!fieldNode.isFocused) {
             // A real tap focuses and brings up the IME, which ACTION_FOCUS alone doesn't always do
             Gestures(svc).tap(center(fieldNode))
             val deadline = SystemClock.uptimeMillis() + 1500
@@ -739,12 +772,22 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             delay(100)
             msg += if (withContext(Dispatchers.Main) { input.submit() }) " and submitted" else " (couldn't submit: no IME action available)"
         } else {
-            delay(150)
+            svc.waitForIdle(quietMs = 200, timeoutMs = 1000)
             svc.focusedInput()?.takeIf { it.isEditable }?.let { f ->
-                msg += if (f.isPassword) "; field is a password field" else "; field now: \"${f.text?.toString()?.take(200) ?: ""}\""
+                f.refresh()
+                val now = if (f.isShowingHintText) "" else f.text?.toString()?.take(200) ?: ""
+                msg += if (f.isPassword) "; field is a password field" else "; field now: \"$now\""
             }
         }
         return finish(svc, call, msg)
+    }
+
+    private suspend fun awaitFocusedField(svc: ThumbsAccessibilityService, input: TextInput, timeoutMs: Long) {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (svc.focusedInput()?.isEditable == true && (Build.VERSION.SDK_INT < 33 || input.hasImeConnection)) return
+            delay(100)
+        }
     }
 
     private suspend fun pressKey(call: ToolCall): ToolResult {
@@ -766,11 +809,18 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             "headset_hook" -> AccessibilityService.GLOBAL_ACTION_KEYCODE_HEADSETHOOK
             else -> null
         }
-        val svc = if (key == "lock_screen" || key == "lock") ThumbsAccessibilityService.require() else ready()
+        val svc = if (key == "lock_screen" || key == "lock") ThumbsAccessibilityService.require() else ready(allowOwnApp = global != null)
         if (global != null) {
+            val before = svc.currentPackage()
             repeat(if (key == "back") count else 1) {
                 if (!svc.global(global)) throw ToolException("The system rejected '$raw'.")
                 if (count > 1) delay(250)
+            }
+            // Navigation starts window transitions that outlast a short idle wait
+            if (key in setOf("home", "back", "recents", "app_switch", "overview", "all_apps", "app_drawer")) {
+                val deadline = SystemClock.uptimeMillis() + 1500
+                delay(250)
+                while (svc.currentPackage() == before && SystemClock.uptimeMillis() < deadline) delay(100)
             }
             return finish(svc, call, "Pressed $raw")
         }
@@ -801,6 +851,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         }
         val (code, meta) = TextInput.parseKey(raw) ?: throw ToolException("Unknown key '$raw'.")
         val input = TextInput(svc)
+        awaitFocusedField(svc, input, 1000)
         val sent = withContext(Dispatchers.Main) { input.key(code, meta, count) }
         if (!sent) {
             // D-pad navigation still works without a text field via global actions (Android 13+)

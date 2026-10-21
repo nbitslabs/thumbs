@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.PersistableBundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -99,6 +100,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Keeps API keys out of screenshots, including the agent-facing screenshot tool
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val app = ThumbsApp.get(this)
         app.startServerIfEnabled()
         setContent { ThumbsTheme { MainScreen(app) } }
