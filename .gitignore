@@ -20,3 +20,4 @@ captures/
 *.aab
 *.keystore
 *.jks
+.cxx/
