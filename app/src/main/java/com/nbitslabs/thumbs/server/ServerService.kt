@@ -14,6 +14,9 @@ import androidx.lifecycle.lifecycleScope
 import com.nbitslabs.thumbs.BuildConfig
 import com.nbitslabs.thumbs.R
 import com.nbitslabs.thumbs.ThumbsApp
+import com.nbitslabs.thumbs.a11y.ThumbsAccessibilityService
+import com.nbitslabs.thumbs.device.Apps
+import com.nbitslabs.thumbs.device.DeviceState
 import com.nbitslabs.thumbs.mcp.McpServer
 import com.nbitslabs.thumbs.mcp.PhoneTools
 import com.nbitslabs.thumbs.safety.Confirmations
@@ -21,6 +24,8 @@ import com.nbitslabs.thumbs.ui.MainActivity
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 /**
  * Foreground service hosting the MCP HTTP server. The persistent notification doubles as a
@@ -29,6 +34,7 @@ import kotlinx.coroutines.launch
 class ServerService : LifecycleService() {
     private var server: HttpServer? = null
     private var activeJob: Job? = null
+    private var activeClient: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -39,7 +45,12 @@ class ServerService : LifecycleService() {
                 setShowBadge(false)
             },
         )
+        // Anyone watching the live view is shown in the notification
+        lifecycleScope.launch { ThumbsApp.get(this@ServerService).liveView.viewers.collect { refreshNotification() } }
     }
+
+    private fun refreshNotification() =
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(activeClient))
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -60,7 +71,7 @@ class ServerService : LifecycleService() {
 
     private fun startServer(app: ThumbsApp) {
         val port = app.settings.port.value
-        val tools = PhoneTools(applicationContext, app.settings, Confirmations(applicationContext, { app.settings.confirmMode.value }))
+        val tools = PhoneTools(applicationContext, app.settings, Confirmations(applicationContext, { app.settings.confirmMode.value }), app.liveView)
         val toolList = tools.all()
         val mcp = McpServer(
             tools = { toolList },
@@ -68,7 +79,12 @@ class ServerService : LifecycleService() {
             instructions = tools.instructions,
             onAudit = app::recordAudit,
         )
-        val http = HttpServer(port, { app.settings.networkMode.value }, app.keys, mcp, ::onClientRequest)
+        val http = HttpServer(
+            port, { app.settings.networkMode.value }, app.keys, mcp, ::onClientRequest,
+            liveView = app.liveView,
+            auditEvents = app.auditEvents,
+            viewStatus = ::viewStatus,
+        )
         try {
             http.start()
             server = http
@@ -80,16 +96,32 @@ class ServerService : LifecycleService() {
         }
     }
 
+    private fun viewStatus() = buildJsonObject {
+        val pkg = ThumbsAccessibilityService.instance?.currentPackage()
+        pkg?.let { put("foreground", Apps.label(this@ServerService, it) ?: it) }
+        put(
+            "screen",
+            when {
+                !DeviceState.isScreenOn(this@ServerService) -> "screen off"
+                DeviceState.isLocked(this@ServerService) -> "locked"
+                else -> "unlocked"
+            },
+        )
+        put("viewers", ThumbsApp.get(this@ServerService).liveView.viewers.value)
+    }
+
     private fun onClientRequest(keyName: String) {
         val app = ThumbsApp.get(this)
         val now = System.currentTimeMillis()
         val wasActive = now - app.status.value.lastRequestAt < ACTIVE_WINDOW_MS
         app.updateStatus { it.copy(lastClient = keyName, lastRequestAt = now) }
-        if (!wasActive) getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(keyName))
+        activeClient = keyName
+        if (!wasActive) refreshNotification()
         activeJob?.cancel()
         activeJob = lifecycleScope.launch {
             delay(ACTIVE_WINDOW_MS)
-            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(null))
+            activeClient = null
+            refreshNotification()
         }
     }
 
@@ -100,13 +132,15 @@ class ServerService : LifecycleService() {
         val stop = PendingIntent.getService(
             this, 1, Intent(this, ServerService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
         )
-        val text = if (activeClient != null) {
+        val base = if (activeClient != null) {
             getString(R.string.notification_active, activeClient)
         } else if (address != null) {
             getString(R.string.notification_listening, "$address:$port")
         } else {
             getString(R.string.notification_listening_no_tailscale, port)
         }
+        val viewers = ThumbsApp.get(this).liveView.viewers.value
+        val text = if (viewers > 0) base + " · " + resources.getQuantityString(R.plurals.notification_viewers, viewers, viewers) else base
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(if (activeClient != null) R.string.notification_title_active else R.string.notification_title))

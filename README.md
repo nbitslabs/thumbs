@@ -18,6 +18,7 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 - **Brute force.** An address is locked out for 5 minutes after 10 failed authentications.
 - **The Thumbs app is off-limits to agents.** Agents can't see it in the UI tree or screenshots (`FLAG_SECURE`), operate it, or launch it. This stops an agent from minting itself new keys or widening network access.
 - **Approval on the phone (opt-in).** Settings → *Ask on this phone before agents act* can be set to *risky actions* or *every action*; it's off by default. A prompt then appears over the screen, describing the action ("Tap “Send” in WhatsApp", "Type and submit in Gmail: “…”"), and the agent waits up to 45 seconds for *Allow*, *Deny*, or *Allow everything from this key for 10 min*. Risky actions are recognised from the control's label (send, pay, delete, post, call, …, read by OCR in apps that hide their UI), a keyboard "send" action, notification replies, and raw intents. Icon-only buttons without a label can slip through, so use *every action* when that matters. Agents can't approve prompts themselves: control tools run one at a time, so no agent gesture can happen while a prompt waits, and the prompt is hidden from the UI tree and screenshots.
+- **Live view links.** The browser live view can't send an API key, so it uses separate view-only links: random tokens that expire (1 minute to 24 hours), die when the key that created them is revoked or expires, and can all be ended at once in the app. They are subject to the same network policy and lockout as API keys. The page sends no referrer, isn't cached, and loads nothing external. The notification shows how many people are watching.
 - **Audit.** The app shows a log of every tool call, with the key, arguments and result. Arguments that may hold typed text, URLs or replies are not recorded.
 - **Agent instructions.** The MCP `instructions` tell agents never to enter PINs, passwords or 2FA codes, to ask the user to unlock a secure lock screen, and to confirm before sending, buying, deleting or changing security settings.
 
@@ -31,6 +32,7 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 | Apps | `open_app`, `open_url`, `start_intent` |
 | Notifications | `open_notification`, `notification_action` (including inline replies), `dismiss_notification` |
 | Power | `wake_screen` (`press_key lock_screen` locks) |
+| Live view | `get_view_link` (read-only keys too) |
 
 Conventions:
 
@@ -83,6 +85,17 @@ scripts/mcp_call.py get_ui_tree
 scripts/mcp_call.py tap '{"text": "Settings"}'
 scripts/mcp_call.py screenshot --image /tmp/screen.jpg
 ```
+
+## Live view
+
+To watch an agent work, open a live view link in a browser on your tailnet. It shows the screen at about 3 frames per second, the foreground app and lock state, and a feed of every tool call (with the same argument redaction as the audit log).
+
+- Agents call `get_view_link` (optionally with `minutes`) and hand you the URL.
+- In the app, *Live view → Create link* makes a 1-hour link; *End all live views* revokes every link and closes open streams.
+
+Frames come from the same accessibility screenshots agents use. Android allows about three a second, so it's a slideshow rather than video. Capture only runs while someone is watching, and agents' own screenshots are shared with viewers rather than captured twice. Up to 4 streams can be open at once. The Thumbs app itself and other secure screens appear black.
+
+For smooth video on your own computer, [scrcpy](https://github.com/Genymobile/scrcpy) works over Tailscale if you enable Wireless debugging on the phone (`adb pair`, `adb connect <phone>:<port>`, `scrcpy`). Note that this grants full adb access, far beyond a Thumbs key, and needs re-pairing after reboots.
 
 ## Development
 

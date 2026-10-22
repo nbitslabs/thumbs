@@ -10,6 +10,10 @@
     <string name="notification_title_active">Agent controlling this phone</string>
     <string name="notification_listening">Listening on %1$s</string>
     <string name="notification_listening_no_tailscale">Port %1$d · Tailscale not connected</string>
+    <plurals name="notification_viewers">
+        <item quantity="one">%1$d watching live view</item>
+        <item quantity="other">%1$d watching live view</item>
+    </plurals>
     <string name="notification_active">Key \"%1$s\" is making requests</string>
     <string name="stop">Stop</string>
 </resources>

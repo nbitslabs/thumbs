@@ -155,6 +155,8 @@ private fun MainScreen(app: ThumbsApp) {
     val confirmMode by app.settings.confirmMode.collectAsStateWithLifecycle()
     val keys by app.keys.keys.collectAsStateWithLifecycle()
     val audit by app.audit.collectAsStateWithLifecycle()
+    val viewers by app.liveView.viewers.collectAsStateWithLifecycle()
+    var viewLink by remember { mutableStateOf<String?>(null) }
 
     var showCreate by remember { mutableStateOf(false) }
     var created by remember { mutableStateOf<CreatedKey?>(null) }
@@ -212,6 +214,32 @@ private fun MainScreen(app: ThumbsApp) {
                             "Last request: ${status.lastClient} at ${DateFormat.getTimeInstance().format(Date(status.lastRequestAt))}",
                             style = MaterialTheme.typography.bodySmall,
                         )
+                    }
+                }
+            }
+
+            item {
+                Section("Live view") {
+                    Text(
+                        "Watch the screen (about 3 frames a second) and agents' actions in a browser on your tailnet. Agents can create links with get_view_link.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (viewers > 0) {
+                        Text("$viewers watching now", fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 4.dp))
+                    }
+                    viewLink?.let {
+                        Text("Link (works for 1 hour; anyone with it on the tailnet can watch)", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 8.dp))
+                        CopyableMono(it, sensitive = true)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+                        FilledTonalButton(enabled = status.running, onClick = {
+                            val (token, _) = app.liveView.createLink(null, "Thumbs app", 3_600_000L)
+                            viewLink = "http://${urlHost ?: "127.0.0.1"}:$port/view?t=$token"
+                        }) { Text("Create link") }
+                        OutlinedButton(onClick = {
+                            app.liveView.endAll()
+                            viewLink = null
+                        }) { Text("End all live views") }
                     }
                 }
             }

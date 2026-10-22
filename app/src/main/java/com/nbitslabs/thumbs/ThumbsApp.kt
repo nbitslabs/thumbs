@@ -9,6 +9,10 @@ import com.nbitslabs.thumbs.mcp.AuditEvent
 import com.nbitslabs.thumbs.safety.ConfirmMode
 import com.nbitslabs.thumbs.server.NetworkMode
 import com.nbitslabs.thumbs.server.ServerService
+import com.nbitslabs.thumbs.view.LiveView
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,10 +24,16 @@ class ThumbsApp : Application() {
         private set
     lateinit var keys: ApiKeyStore
         private set
+    lateinit var liveView: LiveView
+        private set
 
     private val _audit = MutableStateFlow<List<AuditEvent>>(emptyList())
     /** Most recent tool calls, newest first. In memory only. */
     val audit: StateFlow<List<AuditEvent>> = _audit.asStateFlow()
+
+    private val _auditEvents = MutableSharedFlow<AuditEvent>(extraBufferCapacity = 64)
+    /** Each tool call as it happens, for the live view's activity feed. */
+    val auditEvents: SharedFlow<AuditEvent> = _auditEvents.asSharedFlow()
 
     private val _status = MutableStateFlow(ServerStatus())
     val status: StateFlow<ServerStatus> = _status.asStateFlow()
@@ -32,10 +42,12 @@ class ThumbsApp : Application() {
         super.onCreate()
         settings = Settings(this)
         keys = ApiKeyStore(File(filesDir, "api_keys.json"))
+        liveView = LiveView(keys)
     }
 
     fun recordAudit(event: AuditEvent) {
         _audit.update { (listOf(event) + it).take(MAX_AUDIT) }
+        _auditEvents.tryEmit(event)
     }
 
     fun updateStatus(block: (ServerStatus) -> ServerStatus) = _status.update(block)

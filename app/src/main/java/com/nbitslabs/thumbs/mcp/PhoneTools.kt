@@ -33,6 +33,7 @@ import com.nbitslabs.thumbs.device.NotificationListener
 import com.nbitslabs.thumbs.safety.Confirmations
 import com.nbitslabs.thumbs.safety.RiskyActions
 import com.nbitslabs.thumbs.server.AccessPolicy
+import com.nbitslabs.thumbs.view.LiveView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -50,6 +51,7 @@ class PhoneTools(
     private val context: Context,
     private val settings: Settings,
     private val confirmations: Confirmations,
+    private val liveView: LiveView,
 ) {
 
     val instructions = """
@@ -159,6 +161,27 @@ class PhoneTools(
             },
             scope = Scope.READ,
         ) { call -> readScreenText(call) },
+
+        Tool(
+            name = "get_view_link",
+            description = "Create a link to a live view of the phone's screen (about 3 frames per second) with a feed of agents' actions, to open in a browser on the tailnet. Give it to the user when they want to watch you work. The link is view-only, expires, and stops working if your API key is revoked.",
+            inputSchema = schema { integer("minutes", "How long the link works (default 60, max 1440).") },
+            scope = Scope.READ,
+            exclusive = false,
+        ) { call ->
+            val minutes = (call.int("minutes") ?: 60).coerceIn(1, 1440)
+            val (token, info) = liveView.createLink(call.key.id, call.key.name, minutes * 60_000L)
+            val port = settings.port.value
+            val host = AccessPolicy.tailscaleAddresses().let { addrs ->
+                addrs.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: addrs.firstOrNull()?.let { "[${it.hostAddress}]" }
+            }
+            val path = "/view?t=$token"
+            val expires = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT).format(java.util.Date(info.expiresAt))
+            ToolResult.text(
+                if (host != null) "Live view: http://$host:$port$path\nWorks for $minutes min (until $expires) from devices on the tailnet."
+                else "Tailscale isn't connected on the phone, so there's no tailnet address. With adb forwarding use http://127.0.0.1:$port$path (until $expires).",
+            )
+        },
 
         Tool(
             name = "wait_for",
@@ -847,6 +870,7 @@ class PhoneTools(
             val out = ByteArrayOutputStream()
             val png = format == "png"
             scaled.compress(if (png) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 100), out)
+            if (!png) liveView.offer(out.toByteArray())
             if (scaled !== raw) scaled.recycle()
             raw.recycle()
             listOfNotNull(
