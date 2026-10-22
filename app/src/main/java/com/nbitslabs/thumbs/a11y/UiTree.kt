@@ -46,6 +46,11 @@ class TreeOptions(
 
 class UiSnapshot(val text: String, val nodeCount: Int, val truncated: Boolean)
 
+/** Shown when an app draws its own UI and exposes (almost) nothing to accessibility services. */
+const val OPAQUE_APP_NOTE =
+    "(this app exposes no accessibility info: it draws its own UI, like WeChat, games and some Flutter/Unity apps. " +
+        "Use screenshot or read_screen_text to see it, and tap by x/y or text)"
+
 object UiTree {
     fun snapshot(service: ThumbsAccessibilityService, space: CoordinateSpace, options: TreeOptions = TreeOptions()): UiSnapshot {
         val sb = StringBuilder()
@@ -84,6 +89,8 @@ object UiTree {
                 if (!options.includeSystemWindows && w.type != AccessibilityWindowInfo.TYPE_APPLICATION && w.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
                 val root = w.root ?: continue
                 if (root.packageName?.toString() == service.packageName) {
+                    // Our own invisible overlays (keep-awake, confirmation prompts) aren't app UI
+                    if (w.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
                     sb.append("## window app=").append(service.packageName).append(" (hidden: the Thumbs app can only be used by the person holding the phone)\n")
                     continue
                 }
@@ -93,12 +100,40 @@ object UiTree {
                 if (w.isActive) sb.append(" active")
                 if (w.isFocused) sb.append(" focused")
                 sb.append('\n')
+                val before = count
                 walk(root, 1)
+                if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION && count - before <= OPAQUE_MAX_NODES && !truncated) {
+                    sb.append("  ").append(OPAQUE_APP_NOTE).append('\n')
+                }
             }
         }
         if (truncated) sb.append("… truncated at ${options.maxNodes} elements; pass max_nodes to see more\n")
         return UiSnapshot(sb.toString(), count, truncated)
     }
+
+    /**
+     * Package of the front app window when that app exposes (almost) no accessibility nodes,
+     * e.g. WeChat or a game. Such apps can only be driven by screenshot and coordinates.
+     */
+    fun opaqueApp(service: ThumbsAccessibilityService): String? {
+        val window = service.orderedWindows().firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION } ?: return null
+        val root = window.root ?: return null
+        val pkg = root.packageName?.toString() ?: return null
+        if (pkg == service.packageName) return null
+        var interesting = 0
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(root)
+        while (stack.isNotEmpty()) {
+            val n = stack.removeLast()
+            if (!n.isVisibleToUser) continue
+            if (isInteresting(n) && ++interesting > OPAQUE_MAX_NODES) return null
+            for (i in 0 until n.childCount) n.getChild(i)?.let(stack::addLast)
+        }
+        return pkg
+    }
+
+    /** At most this many meaningful nodes in an app window means the app hides its UI. */
+    private const val OPAQUE_MAX_NODES = 2
 
     fun isInteresting(n: AccessibilityNodeInfo): Boolean =
         !n.text.isNullOrBlank() || !n.contentDescription.isNullOrBlank() || !n.hintText.isNullOrBlank() ||

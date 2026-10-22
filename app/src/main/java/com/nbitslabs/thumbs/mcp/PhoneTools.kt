@@ -16,6 +16,10 @@ import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction
 import com.nbitslabs.thumbs.auth.Scope
 import com.nbitslabs.thumbs.a11y.CoordinateSpace
 import com.nbitslabs.thumbs.a11y.Gestures
+import com.nbitslabs.thumbs.a11y.ScreenText
+import com.nbitslabs.thumbs.a11y.ScreenTextItem
+import com.nbitslabs.thumbs.a11y.TextGranularity
+import com.nbitslabs.thumbs.a11y.TextScript
 import com.nbitslabs.thumbs.a11y.TextInput
 import com.nbitslabs.thumbs.a11y.ThumbsAccessibilityService
 import com.nbitslabs.thumbs.a11y.TreeOptions
@@ -44,6 +48,8 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         Thumbs controls an Android phone through its accessibility service.
 
         Workflow: call get_ui_tree (cheap, text) or screenshot (visual) to see the screen, act with tap/type_text/scroll/press_key/open_app, then verify. Taps on empty space "succeed" silently, so always check the result; control tools accept observe="tree"|"screenshot"|"both" to get the new state back immediately.
+
+        Apps that draw their own UI (WeChat, games, some Flutter/Unity apps) show almost nothing in get_ui_tree; use screenshot or read_screen_text (OCR, with tappable bounds) there, and tap by x/y or text (text targets fall back to OCR).
 
         Targeting: prefer element refs like "e12" from get_ui_tree/find_elements; they stay valid while the element is on screen. You can also pass text="Label" or x/y coordinates. All coordinates use the screenshot's pixel grid (see get_device_state), so a point in a screenshot can be tapped directly.
 
@@ -119,13 +125,28 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             val query = call.requireString("query")
             val matches = UiTree.find(svc, query, call.bool("clickable_only") == true).take((call.int("limit") ?: 20).coerceIn(1, 200))
             if (matches.isEmpty()) {
-                ToolResult.text("No elements match '$query'. Visible labels: ${UiTree.visibleLabels(svc)}")
+                ToolResult.text("No elements match '$query'. " + notFoundHint(svc))
             } else {
                 val sp = space()
                 val r = Rect()
                 ToolResult.text(matches.joinToString("\n") { it.getBoundsInScreen(r); UiTree.describe(it, sp, r, 160) })
             }
         },
+
+        Tool(
+            name = "read_screen_text",
+            description = "Read the text on screen with on-device OCR. Use it for apps that hide their UI from get_ui_tree (WeChat, games, Flutter/Unity apps), web content and email bodies, and text inside images. Returns each line as \"text\" @left,top,right,bottom in the coordinate space; tap a line's centre to tap it. Recognition can make small errors.",
+            inputSchema = schema {
+                number("x1", "Only read this region: left.")
+                number("y1", "Region top.")
+                number("x2", "Region right.")
+                number("y2", "Region bottom.")
+                string("query", "Only return text containing this (case-insensitive).")
+                string("script", "latin (default) or chinese (also reads Latin; use for Chinese/Japanese text).", enum = listOf("latin", "chinese"))
+                string("granularity", "line (default), block (paragraphs), or word.", enum = listOf("line", "block", "word"))
+            },
+            scope = Scope.READ,
+        ) { call -> readScreenText(call) },
 
         Tool(
             name = "wait_for",
@@ -548,7 +569,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
 
     private fun SchemaBuilder.targetProps() {
         string("ref", "Element ref from get_ui_tree/find_elements, e.g. \"e12\".")
-        string("text", "Target the best element matching this text/description/id instead.")
+        string("text", "Target the best element matching this text/description/id instead; falls back to text found on screen by OCR.")
         number("x", "X coordinate (with y) when not using ref/text.")
         number("y", "Y coordinate (with x).")
     }
@@ -561,16 +582,26 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         val label: String
 
         class Element(val node: AccessibilityNodeInfo, override val screenPoint: PointF, override val label: String) : Target
-        class Point(override val screenPoint: PointF, override val label: String) : Target
+        /** A coordinate, or on-screen text found by OCR ([text]). */
+        class Point(override val screenPoint: PointF, override val label: String, val text: String? = null) : Target
     }
 
-    private fun resolveTarget(svc: ThumbsAccessibilityService, call: ToolCall): Target {
+    private suspend fun resolveTarget(svc: ThumbsAccessibilityService, call: ToolCall): Target {
         val sp = space()
+        val query = call.string("text")
         val node = call.string("ref")?.let { UiTree.resolveRef(it) }
-            ?: call.string("text")?.let { q ->
-                UiTree.find(svc, q, clickableOnly = true).firstOrNull() ?: UiTree.find(svc, q).firstOrNull()
-                    ?: throw ToolException("No element matches '$q'. Visible labels: ${UiTree.visibleLabels(svc)}")
-            }
+            ?: query?.let { q -> UiTree.find(svc, q, clickableOnly = true).firstOrNull() ?: UiTree.find(svc, q).firstOrNull() }
+        if (node == null && query != null) {
+            // Not in the tree: the app may draw its own UI, so look for the text on screen
+            val hit = ScreenText.find(recognizeScreen(svc, null, scriptFor(query), TextGranularity.LINE), query)
+                ?: throw ToolException("No element or on-screen text matches '$query'. " + notFoundHint(svc))
+            val b = sp.fromScreen(hit.bounds)
+            return Target.Point(
+                PointF(hit.bounds.exactCenterX(), hit.bounds.exactCenterY()),
+                "\"${hit.text}\" (screen text) @${b.left},${b.top},${b.right},${b.bottom}",
+                text = hit.text,
+            )
+        }
         if (node != null) {
             val r = boundsOf(node)
             if (r.isEmpty) throw ToolException("That element has no visible area; scroll it into view (element_action show_on_screen) first.")
@@ -585,6 +616,10 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         }
         throw ToolException("Specify a target: ref, text, or x and y.")
     }
+
+    private fun notFoundHint(svc: ThumbsAccessibilityService): String =
+        if (UiTree.opaqueApp(svc) != null) "The app in front exposes no accessibility info; use screenshot or read_screen_text and tap by x/y."
+        else "Visible labels: ${UiTree.visibleLabels(svc)}"
 
     private fun boundsOf(node: AccessibilityNodeInfo) = Rect().also { node.getBoundsInScreen(it) }
     private fun center(node: AccessibilityNodeInfo): PointF = boundsOf(node).let { PointF(it.exactCenterX(), it.exactCenterY()) }
@@ -650,7 +685,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             raw.recycle()
             listOfNotNull(
                 Content.Image(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP), if (png) "image/png" else "image/jpeg"),
-                if (black) Content.Text("Note: the screenshot is black. The screen is off, or the app in front blocks capture (FLAG_SECURE, e.g. banking or password screens); get_ui_tree still works there.") else null,
+                if (black) Content.Text(BLACK_SCREEN_NOTE) else null,
             )
         }
     }
@@ -679,6 +714,16 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             "right" -> PointF(cx - halfW, cy) to PointF(cx + halfW, cy)
             else -> throw ToolException("direction must be up, down, left or right")
         }
+    }
+
+    private companion object {
+        /** Mean luminance change above which a scroll in an app without a tree counts as moving. */
+        const val IMAGE_MOVED_THRESHOLD = 2.0
+
+        const val BLACK_SCREEN_NOTE = "Note: the screen is black. The screen is off, or the app in front blocks capture " +
+            "(FLAG_SECURE, e.g. banking or password screens); get_ui_tree still works there."
+
+        val CJK_SCRIPTS = setOf(Character.UnicodeScript.HAN, Character.UnicodeScript.HIRAGANA, Character.UnicodeScript.KATAKANA)
     }
 
     private fun screenFingerprint(svc: ThumbsAccessibilityService, within: Rect?): Int {
@@ -731,13 +776,109 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             "right" -> "left"
             else -> throw ToolException("direction must be up, down, left or right")
         }
-        val before = screenFingerprint(svc, region)
+        // Apps that hide their UI give no tree to compare, so compare pixels instead
+        val byImage = UiTree.opaqueApp(svc) != null
+        val beforeTree = if (byImage) 0 else screenFingerprint(svc, region)
+        val beforeImage = if (byImage) imageFingerprint(svc, region) else null
         val (from, to) = fingerPath(region, fingerDir, amount)
         Gestures(svc).scroll(from, to, 450)
         svc.waitForIdle(quietMs = 250, timeoutMs = 1500)
-        val moved = screenFingerprint(svc, region) != before
-        return finish(svc, call, if (moved) "Scrolled $dir" else "Scrolled $dir but nothing moved; probably at the end.")
+        val moved: Boolean? = if (byImage) {
+            delay(150)
+            val after = imageFingerprint(svc, region)
+            if (beforeImage == null || after == null) null else imageDifference(beforeImage, after) > IMAGE_MOVED_THRESHOLD
+        } else {
+            screenFingerprint(svc, region) != beforeTree
+        }
+        return finish(
+            svc, call,
+            when (moved) {
+                true -> "Scrolled $dir"
+                false -> "Scrolled $dir but nothing moved; probably at the end."
+                null -> "Scrolled $dir (couldn't check whether it moved; take a screenshot)"
+            },
+        )
     }
+
+    /** Downsampled luminance of [region] (screen px), or null when the screen can't be captured. */
+    private suspend fun imageFingerprint(svc: ThumbsAccessibilityService, region: Rect): IntArray? {
+        val shot = try {
+            svc.screenshot()
+        } catch (e: ToolException) {
+            return null
+        }
+        return withContext(Dispatchers.Default) {
+            val r = Rect(region)
+            if (!r.intersect(0, 0, shot.width, shot.height) || r.isEmpty) return@withContext null
+            val crop = Bitmap.createBitmap(shot, r.left, r.top, r.width(), r.height())
+            val small = Bitmap.createScaledBitmap(crop, 32, 64, true)
+            val px = IntArray(small.width * small.height)
+            small.getPixels(px, 0, small.width, 0, 0, small.width, small.height)
+            listOf(small, crop, shot).distinct().forEach { it.recycle() }
+            IntArray(px.size) { i -> val c = px[i]; ((c shr 16 and 0xff) * 3 + (c shr 8 and 0xff) * 6 + (c and 0xff)) / 10 }
+        }
+    }
+
+    /** Mean absolute luminance difference (0-255) between two fingerprints. */
+    private fun imageDifference(a: IntArray, b: IntArray): Double =
+        a.indices.sumOf { kotlin.math.abs(a[it] - b[it]) }.toDouble() / a.size
+
+    private suspend fun readScreenText(call: ToolCall): ToolResult {
+        val svc = ThumbsAccessibilityService.require()
+        val sp = space()
+        val region = if (call.has("x1")) {
+            Rect(
+                sp.toScreenX(call.requireDouble("x1")).toInt(), sp.toScreenY(call.requireDouble("y1")).toInt(),
+                sp.toScreenX(call.requireDouble("x2")).toInt(), sp.toScreenY(call.requireDouble("y2")).toInt(),
+            ).also { if (it.isEmpty) throw ToolException("The region is empty; give x1,y1 (top-left) and x2,y2 (bottom-right).") }
+        } else {
+            null
+        }
+        val query = call.string("query")
+        val script = when (call.string("script")) {
+            "chinese" -> TextScript.CHINESE
+            "latin" -> TextScript.LATIN
+            else -> query?.let(::scriptFor) ?: TextScript.LATIN
+        }
+        val granularity = when (call.string("granularity")) {
+            "block" -> TextGranularity.BLOCK
+            "word" -> TextGranularity.WORD
+            else -> TextGranularity.LINE
+        }
+        var items = recognizeScreen(svc, region, script, granularity)
+        if (query != null) items = items.filter { it.text.contains(query, ignoreCase = true) }
+        val text = items.joinToString("\n") { item ->
+            val b = sp.fromScreen(item.bounds)
+            "\"${item.text}\" @${b.left},${b.top},${b.right},${b.bottom}"
+        }
+        val summary = when {
+            items.isEmpty() && query != null -> "No text containing '$query' found on screen."
+            items.isEmpty() -> "No text found on screen."
+            else -> "${items.size} ${granularity.name.lowercase()}s (OCR, may contain small errors):"
+        }
+        return ToolResult.text("$summary\n${header(svc)}" + if (text.isNotEmpty()) "\n$text" else "")
+    }
+
+    /** OCR of the screen, or of [region] (screen px) when given. Results are in screen px. */
+    private suspend fun recognizeScreen(
+        svc: ThumbsAccessibilityService,
+        region: Rect?,
+        script: TextScript,
+        granularity: TextGranularity,
+    ): List<ScreenTextItem> {
+        val shot = svc.screenshot()
+        try {
+            if (isBlank(shot)) throw ToolException(BLACK_SCREEN_NOTE)
+            val crop = region?.let { Rect(it).takeIf { r -> r.intersect(0, 0, shot.width, shot.height) && !r.isEmpty } }
+            val input = crop?.let { Bitmap.createBitmap(shot, it.left, it.top, it.width(), it.height()) } ?: shot
+            return ScreenText.recognize(input, script, granularity, crop).also { if (input !== shot) input.recycle() }
+        } finally {
+            shot.recycle()
+        }
+    }
+
+    private fun scriptFor(text: String): TextScript =
+        if (text.any { Character.UnicodeScript.of(it.code) in CJK_SCRIPTS }) TextScript.CHINESE else TextScript.LATIN
 
     private suspend fun typeText(call: ToolCall): ToolResult {
         val svc = ready()

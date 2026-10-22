@@ -15,6 +15,8 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        // 64-bit phones and emulators only; the bundled OCR libraries are ~11 MB per ABI
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
     buildTypes {
@@ -60,6 +62,9 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
+    // Bundled on-device OCR models, so reading the screen works without Play services or a download
+    implementation(libs.mlkit.text.latin)
+    implementation(libs.mlkit.text.chinese)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
