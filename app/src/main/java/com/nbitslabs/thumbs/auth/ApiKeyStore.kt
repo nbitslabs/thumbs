@@ -29,7 +29,11 @@ data class ApiKey(
     val scope: Scope,
     val createdAt: Long,
     val lastUsedAt: Long? = null,
-)
+    /** When set, the key stops working at this time. */
+    val expiresAt: Long? = null,
+) {
+    fun isExpired(now: Long) = expiresAt != null && now >= expiresAt
+}
 
 data class CreatedKey(val key: ApiKey, val token: String)
 
@@ -46,7 +50,7 @@ class ApiKeyStore(private val file: File, private val clock: () -> Long = System
     // lastUsedAt is updated in memory on every request and flushed at most this often
     private var lastFlush = 0L
 
-    fun create(name: String, scope: Scope): CreatedKey {
+    fun create(name: String, scope: Scope, validForMs: Long? = null): CreatedKey {
         val token = generateToken()
         val key = ApiKey(
             id = UUID.randomUUID().toString(),
@@ -55,6 +59,7 @@ class ApiKeyStore(private val file: File, private val clock: () -> Long = System
             hash = sha256(token),
             scope = scope,
             createdAt = clock(),
+            expiresAt = validForMs?.let { clock() + it },
         )
         synchronized(lock) {
             _keys.value = _keys.value + key
@@ -68,13 +73,14 @@ class ApiKeyStore(private val file: File, private val clock: () -> Long = System
         save()
     }
 
-    /** Returns the key matching [token], or null. Records usage time. */
+    /** Returns the key matching [token], or null (also when it has expired). Records usage time. */
     fun authenticate(token: String): ApiKey? {
         if (!token.startsWith(TOKEN_PREFIX) || token.length > 128) return null
         val hash = sha256(token).toByteArray()
         synchronized(lock) {
             val match = _keys.value.firstOrNull { MessageDigest.isEqual(it.hash.toByteArray(), hash) } ?: return null
             val now = clock()
+            if (match.isExpired(now)) return null
             val updated = match.copy(lastUsedAt = now)
             _keys.value = _keys.value.map { if (it.id == match.id) updated else it }
             if (now - lastFlush > FLUSH_INTERVAL_MS) save()

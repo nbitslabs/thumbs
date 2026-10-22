@@ -91,6 +91,7 @@ import com.nbitslabs.thumbs.auth.CreatedKey
 import com.nbitslabs.thumbs.auth.Scope
 import com.nbitslabs.thumbs.device.NotificationListener
 import com.nbitslabs.thumbs.mcp.AuditEvent
+import com.nbitslabs.thumbs.safety.ConfirmMode
 import com.nbitslabs.thumbs.server.AccessPolicy
 import com.nbitslabs.thumbs.server.NetworkMode
 import java.text.DateFormat
@@ -151,6 +152,7 @@ private fun MainScreen(app: ThumbsApp) {
     val networkMode by app.settings.networkMode.collectAsStateWithLifecycle()
     val autoWake by app.settings.autoWake.collectAsStateWithLifecycle()
     val keepAwake by app.settings.keepAwake.collectAsStateWithLifecycle()
+    val confirmMode by app.settings.confirmMode.collectAsStateWithLifecycle()
     val keys by app.keys.keys.collectAsStateWithLifecycle()
     val audit by app.audit.collectAsStateWithLifecycle()
 
@@ -271,6 +273,17 @@ private fun MainScreen(app: ThumbsApp) {
                     RadioRow("Tailscale only (recommended)", networkMode == NetworkMode.TAILSCALE_ONLY) { app.settings.setNetworkMode(NetworkMode.TAILSCALE_ONLY) }
                     RadioRow("Any network (Wi-Fi/LAN too; still needs a key)", networkMode == NetworkMode.ANY) { app.settings.setNetworkMode(NetworkMode.ANY) }
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    Text("Ask on this phone before agents act", style = MaterialTheme.typography.labelMedium)
+                    RadioRow("Never (default)", confirmMode == ConfirmMode.OFF) { app.settings.setConfirmMode(ConfirmMode.OFF) }
+                    RadioRow("Before risky actions: send, pay, delete, post, call…", confirmMode == ConfirmMode.RISKY) { app.settings.setConfirmMode(ConfirmMode.RISKY) }
+                    RadioRow("Before every action", confirmMode == ConfirmMode.ALL) { app.settings.setConfirmMode(ConfirmMode.ALL) }
+                    if (confirmMode != ConfirmMode.OFF) {
+                        Text(
+                            "A prompt appears over the screen and the agent waits up to 45 seconds for you. Risky actions are recognised by the label of the control, so unlabelled icon buttons can slip through; choose every action for full control.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     SwitchRow(
                         "Wake screen for agents",
                         "Turn the screen on when an agent acts or takes a screenshot.",
@@ -301,9 +314,9 @@ private fun MainScreen(app: ThumbsApp) {
     }
 
     if (showCreate) {
-        CreateKeyDialog(onDismiss = { showCreate = false }) { name, scope ->
+        CreateKeyDialog(onDismiss = { showCreate = false }) { name, scope, validForMs ->
             showCreate = false
-            created = app.keys.create(name, scope)
+            created = app.keys.create(name, scope, validForMs)
         }
     }
     created?.let { CreatedKeyDialog(it, url) { created = null } }
@@ -371,6 +384,14 @@ private fun KeyRow(key: ApiKey, onDelete: () -> Unit) {
                     (key.lastUsedAt?.let { "used ${df.format(Date(it))}" } ?: "never used"),
                 style = MaterialTheme.typography.bodySmall,
             )
+            key.expiresAt?.let { expiry ->
+                val expired = key.isExpired(System.currentTimeMillis())
+                Text(
+                    if (expired) "Expired ${df.format(Date(expiry))}" else "Expires ${df.format(Date(expiry))}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (expired) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "Revoke ${key.name}") }
     }
@@ -458,9 +479,10 @@ private fun copy(context: Context, text: String, sensitive: Boolean) {
 }
 
 @Composable
-private fun CreateKeyDialog(onDismiss: () -> Unit, onCreate: (String, Scope) -> Unit) {
+private fun CreateKeyDialog(onDismiss: () -> Unit, onCreate: (String, Scope, Long?) -> Unit) {
     var name by remember { mutableStateOf("") }
     var scope by remember { mutableStateOf(Scope.CONTROL) }
+    var validity by remember { mutableIntStateOf(0) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("New API key") },
@@ -470,12 +492,22 @@ private fun CreateKeyDialog(onDismiss: () -> Unit, onCreate: (String, Scope) -> 
                 Spacer(Modifier.size(12.dp))
                 RadioRow("Full control", scope == Scope.CONTROL) { scope = Scope.CONTROL }
                 RadioRow("Read only (screen, UI tree, notifications)", scope == Scope.READ) { scope = Scope.READ }
+                Spacer(Modifier.size(12.dp))
+                Text("Expires", style = MaterialTheme.typography.labelMedium)
+                KEY_VALIDITY.forEachIndexed { i, (label, _) -> RadioRow(label, validity == i) { validity = i } }
             }
         },
-        confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { onCreate(name, scope) }) { Text("Create") } },
+        confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { onCreate(name, scope, KEY_VALIDITY[validity].second) }) { Text("Create") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
+
+private val KEY_VALIDITY: List<Pair<String, Long?>> = listOf(
+    "Never" to null,
+    "After 1 hour" to 3_600_000L,
+    "After 1 day" to 86_400_000L,
+    "After 30 days" to 30 * 86_400_000L,
+)
 
 @Composable
 private fun CreatedKeyDialog(created: CreatedKey, url: String, onDismiss: () -> Unit) {

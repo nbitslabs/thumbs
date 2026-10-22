@@ -12,11 +12,12 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 
 ## Security model
 
-- **API keys.** Every request needs `Authorization: Bearer thumbs_…`. Create one key per computer or agent in the app; each key is either *Full control* or *Read only* (screen, UI tree, device state, notifications). Keys are 256-bit random tokens shown once; only their SHA-256 is stored, and they are excluded from backups. Revoking a key takes effect immediately.
+- **API keys.** Every request needs `Authorization: Bearer thumbs_…`. Create one key per computer or agent in the app; each key is either *Full control* or *Read only* (screen, UI tree, device state, notifications). Keys are 256-bit random tokens shown once; only their SHA-256 is stored, and they are excluded from backups. Revoking a key takes effect immediately, and a key can be created to expire after an hour, a day or 30 days.
 - **Network.** By default only Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback (for `adb forward`) are accepted. Tailscale encrypts the traffic (WireGuard), which is why plain HTTP is used. "Any network" can be enabled in settings; a key is still required.
 - **Browsers are rejected.** Requests carrying an `Origin` header are refused, which blocks DNS-rebinding attacks from web pages.
 - **Brute force.** An address is locked out for 5 minutes after 10 failed authentications.
 - **The Thumbs app is off-limits to agents.** Agents can't see it in the UI tree or screenshots (`FLAG_SECURE`), operate it, or launch it. This stops an agent from minting itself new keys or widening network access.
+- **Approval on the phone (opt-in).** Settings → *Ask on this phone before agents act* can be set to *risky actions* or *every action*; it's off by default. A prompt then appears over the screen, describing the action ("Tap “Send” in WhatsApp", "Type and submit in Gmail: “…”"), and the agent waits up to 45 seconds for *Allow*, *Deny*, or *Allow everything from this key for 10 min*. Risky actions are recognised from the control's label (send, pay, delete, post, call, …, read by OCR in apps that hide their UI), a keyboard "send" action, notification replies, and raw intents. Icon-only buttons without a label can slip through, so use *every action* when that matters. Agents can't approve prompts themselves: control tools run one at a time, so no agent gesture can happen while a prompt waits, and the prompt is hidden from the UI tree and screenshots.
 - **Audit.** The app shows a log of every tool call, with the key, arguments and result. Arguments that may hold typed text, URLs or replies are not recorded.
 - **Agent instructions.** The MCP `instructions` tell agents never to enter PINs, passwords or 2FA codes, to ask the user to unlock a secure lock screen, and to confirm before sending, buying, deleting or changing security settings.
 
@@ -24,7 +25,7 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 
 | Area | Tools |
 | --- | --- |
-| Observe (read-only keys) | `get_device_state`, `screenshot`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
+| Observe (read-only keys) | `get_device_state`, `screenshot`, `read_screen_text`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
 | Touch | `tap`, `long_press`, `double_tap`, `swipe`, `scroll`, `drag`, `pinch`, `element_action` |
 | Text & keys | `type_text`, `press_key`, `set_clipboard`, `get_clipboard` |
 | Apps | `open_app`, `open_url`, `start_intent` |
@@ -35,6 +36,8 @@ Conventions:
 
 - **Coordinates.** All coordinates share one space: the screen scaled to fit vision-model input limits (e.g. 706×1568 for a 1080×2400 phone). Screenshots come back at exactly that size, so any point in a screenshot can be tapped directly. `get_device_state` reports the mapping.
 - **Element refs.** `get_ui_tree` lists elements as `[e12] Button "OK" {clickable} @left,top,right,bottom`. Refs stay valid while the element is on screen, and most tools accept `ref`, `text` or `x`/`y` as the target.
+- **Apps that hide their UI.** Some apps (WeChat, games, some Flutter/Unity apps) draw their own interface and expose nothing to accessibility. `get_ui_tree` says so, `read_screen_text` reads the screen with on-device OCR (ML Kit, Latin and Chinese, bundled in the app) and returns tappable bounds, `text` targets fall back to OCR, and `scroll` detects the end of a list by comparing screenshots.
+- **Screen.** While an agent works, the screen is kept from dimming or sleeping until 2 minutes after its last step, and a sleeping screen is woken for actions and screenshots. Both can be turned off in settings.
 - **Settling.** Control tools wait for the UI to settle, and accept `observe: "tree" | "screenshot" | "both"` to return the new state in the same call.
 - **Directions.** For `scroll`, the direction is the content to reveal (`down` shows what's below), and it reports when the end has been reached. For `swipe`, the direction is finger motion, as a fast flick.
 
@@ -108,4 +111,4 @@ Then create a key in the app and point a client at `http://127.0.0.1:8765/mcp`.
 - **FLAG_SECURE apps.** Screenshots of banking apps, password prompts and similar screens come back black. The UI tree usually still works.
 - **Key events.** Keyboard keys (enter, tab, ctrl+…) are delivered to the focused text field. Arbitrary key events can't be injected into other views without root.
 - **Clipboard reads.** Reading the clipboard only works while a text field is focused (Android restricts background clipboard access).
-- **Games and canvas apps.** Apps that render without accessibility information (games, some Flutter/canvas apps) can only be driven by screenshot and coordinates.
+- **Games and canvas apps.** Apps that render without accessibility information can only be driven by screenshots, OCR and coordinates; icons without text can't be found by `text`.

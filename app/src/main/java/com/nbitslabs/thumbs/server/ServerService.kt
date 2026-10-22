@@ -16,6 +16,7 @@ import com.nbitslabs.thumbs.R
 import com.nbitslabs.thumbs.ThumbsApp
 import com.nbitslabs.thumbs.mcp.McpServer
 import com.nbitslabs.thumbs.mcp.PhoneTools
+import com.nbitslabs.thumbs.safety.Confirmations
 import com.nbitslabs.thumbs.ui.MainActivity
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -59,7 +60,7 @@ class ServerService : LifecycleService() {
 
     private fun startServer(app: ThumbsApp) {
         val port = app.settings.port.value
-        val tools = PhoneTools(applicationContext, app.settings)
+        val tools = PhoneTools(applicationContext, app.settings, Confirmations(applicationContext, { app.settings.confirmMode.value }))
         val toolList = tools.all()
         val mcp = McpServer(
             tools = { toolList },

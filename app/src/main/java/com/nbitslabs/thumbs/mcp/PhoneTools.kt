@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Base64
 import android.view.KeyEvent
+import android.view.inputmethod.EditorInfo
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction
 import com.nbitslabs.thumbs.Settings
@@ -29,6 +30,8 @@ import com.nbitslabs.thumbs.a11y.UiTree
 import com.nbitslabs.thumbs.device.Apps
 import com.nbitslabs.thumbs.device.DeviceState
 import com.nbitslabs.thumbs.device.NotificationListener
+import com.nbitslabs.thumbs.safety.Confirmations
+import com.nbitslabs.thumbs.safety.RiskyActions
 import com.nbitslabs.thumbs.server.AccessPolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -43,7 +46,11 @@ import java.io.ByteArrayOutputStream
  * coordinates. Control tools wait for the UI to settle before returning, and accept `observe`
  * to return a fresh UI tree and/or screenshot in the same round trip.
  */
-class PhoneTools(private val context: Context, private val settings: Settings) {
+class PhoneTools(
+    private val context: Context,
+    private val settings: Settings,
+    private val confirmations: Confirmations,
+) {
 
     val instructions = """
         Thumbs controls an Android phone through its accessibility service.
@@ -56,12 +63,16 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
 
         Text: tap a field (or pass its ref to type_text) before typing. scroll direction is the content you want to reveal ("down" shows what's below); swipe direction is finger motion.
 
+        Approval: the phone's owner can require on-device approval for some or all actions. Such a call waits (up to 45s) for them to answer; if it fails as declined, don't retry it unless the user asks.
+
         Safety: if the phone is locked with a PIN/password, ask the user to unlock it; never enter their PIN, passwords or 2FA codes unless they explicitly gave them to you for that purpose. Confirm with the user before sending messages, purchases, deleting data or changing security settings. Some screens (banking, password prompts) block screenshots; use get_ui_tree there.
     """.trimIndent()
 
     private fun space() = CoordinateSpace.current(context)
 
-    fun all(): List<Tool> = listOf(
+    fun all(): List<Tool> = tools().map { if (it.scope == Scope.CONTROL && it.name !in SELF_GUARDED) withConfirmation(it) else it }
+
+    private fun tools(): List<Tool> = listOf(
         // --- Observation ------------------------------------------------------------------
         Tool(
             name = "get_device_state",
@@ -230,6 +241,7 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
         ) { call ->
             val svc = ready()
             val target = resolveTarget(svc, call)
+            guardTouch(svc, call, "Tap", target)
             val msg = if (call.string("method") == "action") {
                 val node = (target as? Target.Element)?.node ?: throw ToolException("method=action needs a ref or text target.")
                 val clickable = UiTree.clickableAncestor(node) ?: node
@@ -254,6 +266,7 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
         ) { call ->
             val svc = ready()
             val target = resolveTarget(svc, call)
+            guardTouch(svc, call, "Long-press", target)
             Gestures(svc).longPress(target.screenPoint, (call.int("duration_ms") ?: 800).toLong())
             finish(svc, call, "Long-pressed ${target.label}")
         },
@@ -269,6 +282,7 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
         ) { call ->
             val svc = ready()
             val target = resolveTarget(svc, call)
+            guardTouch(svc, call, "Double-tap", target)
             Gestures(svc).doubleTap(target.screenPoint)
             finish(svc, call, "Double-tapped ${target.label}")
         },
@@ -495,6 +509,11 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
                 throw ToolException("Agents can't open the Thumbs app.")
             }
             val extras = call.obj("extras")?.mapValues { (it.value as? kotlinx.serialization.json.JsonPrimitive)?.content ?: it.value.toString() } ?: emptyMap()
+            if (confirmations.active) {
+                val parts = listOf("action", "data", "type", "package", "component").mapNotNull { k -> call.string(k)?.let { "$k=$it" } } +
+                    extras.map { (k, v) -> "$k=${clip(v, 120)}" }
+                guard(svc, call, "Start an intent: ${parts.joinToString(", ")}", risky = true)
+            }
             val started = withContext(Dispatchers.Main) {
                 Apps.startIntent(svc, call.string("action"), call.string("data"), call.string("type"), call.string("package"), call.string("component"), call.stringList("categories") ?: emptyList(), extras)
             }
@@ -531,7 +550,9 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
             destructive = true,
             logArgs = false,
         ) { call ->
-            val title = NotificationListener.require().action(call.requireString("key"), call.int("index"), call.string("title"), call.string("reply"))
+            val listener = NotificationListener.require()
+            if (confirmations.active) guardNotificationAction(listener, call)
+            val title = listener.action(call.requireString("key"), call.int("index"), call.string("title"), call.string("reply"))
             ToolResult.text("Ran '$title'" + if (call.has("reply")) " with a reply." else ".")
         },
 
@@ -617,6 +638,120 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
             return Target.Point(PointF(sp.toScreenX(x), sp.toScreenY(y)), "(${x.toInt()}, ${y.toInt()})")
         }
         throw ToolException("Specify a target: ref, text, or x and y.")
+    }
+
+    // --- Confirmation (opt-in, see Settings) -------------------------------------------------
+
+    private suspend fun guard(svc: ThumbsAccessibilityService, call: ToolCall, action: String, risky: Boolean) =
+        confirmations.check(svc, call.key, action, risky)
+
+    /** In "ask before every action" mode, tools without their own check ask with a generic description. */
+    private fun withConfirmation(tool: Tool) = Tool(
+        name = tool.name,
+        description = tool.description,
+        inputSchema = tool.inputSchema,
+        scope = tool.scope,
+        readOnly = tool.readOnly,
+        destructive = tool.destructive,
+        exclusive = tool.exclusive,
+        logArgs = tool.logArgs,
+    ) { call ->
+        if (confirmations.needsAsking(call.key, risky = false)) {
+            val args = call.args.entries.filter { it.key != "observe" }.joinToString(", ") { (k, v) ->
+                "$k=${clip((v as? kotlinx.serialization.json.JsonPrimitive)?.content ?: v.toString(), 200)}"
+            }
+            val svc = ThumbsAccessibilityService.require()
+            guard(svc, call, tool.name.replace('_', ' ').replaceFirstChar(Char::uppercase) + (if (args.isNotEmpty()) ": $args" else "") + " (in ${appName(svc)})", risky = false)
+        }
+        tool.handler(call)
+    }
+
+    private suspend fun guardTouch(svc: ThumbsAccessibilityService, call: ToolCall, verb: String, target: Target) {
+        if (!confirmations.active) return
+        val labels = targetLabels(svc, target)
+        val what = labels.firstOrNull()?.let { "\u201c${clip(it, 60)}\u201d" } ?: target.label
+        guard(svc, call, "$verb $what in ${appName(svc)}", RiskyActions.match(labels) != null)
+    }
+
+    private suspend fun guardNotificationAction(listener: NotificationListener, call: ToolCall) {
+        val sbn = listener.find(call.requireString("key"))
+        val app = Apps.label(context, sbn.packageName) ?: sbn.packageName
+        val title = sbn.notification.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.let { " \u201c${clip(it.toString(), 60)}\u201d" } ?: ""
+        val actionTitle = call.string("title") ?: call.int("index")?.let { sbn.notification.actions?.getOrNull(it)?.title?.toString() }
+        val reply = call.string("reply")
+        val description = if (reply != null) {
+            "Reply to the $app notification$title: \u201c${clip(reply, 300)}\u201d"
+        } else {
+            "Tap \u201c${actionTitle ?: "?"}\u201d on the $app notification$title"
+        }
+        guard(ThumbsAccessibilityService.require(), call, description, reply != null || RiskyActions.match(actionTitle) != null)
+    }
+
+    /** What the user would read on the control being touched. */
+    private suspend fun targetLabels(svc: ThumbsAccessibilityService, target: Target): List<String> = when (target) {
+        is Target.Element -> controlLabels(target.node)
+        is Target.Point -> target.text?.let(::listOf)
+            ?: nodeAt(svc, target.screenPoint)?.let(::controlLabels)?.takeIf { it.isNotEmpty() }
+            ?: textNear(svc, target.screenPoint)
+    }
+
+    /** Labels of the clickable control containing [node] and its children, e.g. a button's text. */
+    private fun controlLabels(node: AccessibilityNodeInfo): List<String> {
+        val out = mutableListOf<String>()
+        var level = listOf(UiTree.clickableAncestor(node) ?: node)
+        repeat(4) {
+            for (n in level) {
+                listOfNotNull(n.text?.takeUnless { n.isShowingHintText }, n.contentDescription)
+                    .map { it.toString().trim() }
+                    .filter { it.isNotEmpty() && it !in out }
+                    .forEach { out += it }
+            }
+            if (out.size >= 6) return out.take(6)
+            level = level.flatMap { n -> (0 until n.childCount).mapNotNull { n.getChild(it) } }
+        }
+        return out
+    }
+
+    /** The smallest meaningful node at [p] (screen px). */
+    private fun nodeAt(svc: ThumbsAccessibilityService, p: PointF): AccessibilityNodeInfo? {
+        val r = Rect()
+        return UiTree.allNodes(svc)
+            .filter { n -> n.getBoundsInScreen(r); r.contains(p.x.toInt(), p.y.toInt()) && UiTree.isInteresting(n) }
+            .minByOrNull { n -> n.getBoundsInScreen(r); r.width().toLong() * r.height() }
+    }
+
+    /** OCR text around [p] (screen px), nearest first, for apps that hide their UI. */
+    private suspend fun textNear(svc: ThumbsAccessibilityService, p: PointF): List<String> {
+        val sp = space()
+        val hw = sp.screenWidth * 0.2f
+        val hh = sp.screenHeight * 0.035f
+        val region = Rect((p.x - hw).toInt(), (p.y - hh).toInt(), (p.x + hw).toInt(), (p.y + hh).toInt())
+        val items = try {
+            recognizeScreen(svc, region, TextScript.LATIN, TextGranularity.LINE)
+        } catch (e: ToolException) {
+            return emptyList()
+        }
+        return items.sortedBy { item ->
+            val dx = maxOf(item.bounds.left - p.x, 0f, p.x - item.bounds.right)
+            val dy = maxOf(item.bounds.top - p.y, 0f, p.y - item.bounds.bottom)
+            dx * dx + dy * dy
+        }.map { it.text }.take(3)
+    }
+
+    /** Whether the focused field's keyboard action is "send" (e.g. a chat box). */
+    private fun imeSends(svc: ThumbsAccessibilityService): Boolean {
+        if (Build.VERSION.SDK_INT < 33) return false
+        val info = svc.inputMethod?.currentInputEditorInfo ?: return false
+        return (info.imeOptions and EditorInfo.IME_MASK_ACTION) == EditorInfo.IME_ACTION_SEND ||
+            RiskyActions.match(info.actionLabel?.toString()) != null
+    }
+
+    private fun appName(svc: ThumbsAccessibilityService): String =
+        svc.currentPackage()?.let { Apps.label(context, it) ?: it } ?: "the current app"
+
+    private fun clip(s: String, max: Int): String {
+        val one = s.replace('\n', ' ')
+        return if (one.length <= max) one else one.take(max - 1) + "\u2026"
     }
 
     private fun notFoundHint(svc: ThumbsAccessibilityService): String =
@@ -750,6 +885,9 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
     private companion object {
         /** Mean luminance change above which a scroll in an app without a tree counts as moving. */
         const val IMAGE_MOVED_THRESHOLD = 2.0
+
+        /** Control tools that ask for confirmation themselves, with a description of what they'll touch. */
+        val SELF_GUARDED = setOf("tap", "long_press", "double_tap", "type_text", "press_key", "element_action", "notification_action", "start_intent")
 
         /** How long the screen is kept on after an agent's last look or action. */
         const val KEEP_AWAKE_MS = 120_000L
@@ -942,6 +1080,12 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
             else -> TypeMethod.AUTO
         }
         val text = call.requireString("text")
+        if (confirmations.active) {
+            val submit = call.bool("submit") == true
+            val field = svc.focusedInput()?.let { f -> listOfNotNull(f.hintText, f.contentDescription, f.viewIdResourceName?.substringAfter(":id/")).firstOrNull()?.toString() }
+            val verb = if (submit) "Type and submit" else "Type"
+            guard(svc, call, "$verb${field?.let { " into \u201c${clip(it, 40)}\u201d" } ?: ""} in ${appName(svc)}: \u201c${clip(text, 300)}\u201d", submit && imeSends(svc))
+        }
         val how = withContext(Dispatchers.Main) { input.type(text, call.bool("clear") == true, method) }
         var msg = "Typed ${text.length} chars via $how"
         if (call.bool("submit") == true) {
@@ -987,6 +1131,10 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
         }
         val locking = key == "lock_screen" || key == "lock"
         val svc = if (locking) ThumbsAccessibilityService.require().also { it.releaseScreenOn() } else ready(allowOwnApp = global != null)
+        if (!locking && confirmations.active) {
+            val enter = key == "enter" || key.endsWith("+enter") || key == "keycode_enter"
+            guard(svc, call, "Press $raw in ${appName(svc)}", enter && imeSends(svc))
+        }
         if (global != null) {
             val before = svc.currentPackage()
             repeat(if (key == "back") count else 1) {
@@ -1050,6 +1198,12 @@ class PhoneTools(private val context: Context, private val settings: Settings) {
         val svc = ready()
         val node = UiTree.resolveRef(call.requireString("ref"))
         val action = call.requireString("action")
+        if (confirmations.active) {
+            val labels = controlLabels(node)
+            val what = labels.firstOrNull()?.let { "\u201c${clip(it, 60)}\u201d" } ?: call.requireString("ref")
+            val risky = action in setOf("click", "long_click", "dismiss") && RiskyActions.match(labels) != null
+            guard(svc, call, "${action.replace('_', ' ').replaceFirstChar(Char::uppercase)} $what in ${appName(svc)}", risky)
+        }
         val ok = when (action) {
             "click" -> (UiTree.clickableAncestor(node) ?: node).performAction(AccessibilityNodeInfo.ACTION_CLICK)
             "long_click" -> node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)

@@ -27,6 +27,18 @@ class ApiKeyStoreTest {
         assertTrue(onDisk.contains(ApiKeyStore.sha256(created.token)))
     }
 
+    @Test fun `keys with a validity stop working when they expire`() {
+        var now = 1_000_000L
+        val s = ApiKeyStore(File(tmp.root, "keys.json")) { now }
+        val temporary = s.create("temp", Scope.CONTROL, validForMs = 60_000)
+        val permanent = s.create("perm", Scope.CONTROL)
+        assertEquals(now + 60_000, temporary.key.expiresAt)
+        assertNotNull(s.authenticate(temporary.token))
+        now += 60_000
+        assertNull(s.authenticate(temporary.token))
+        assertNotNull(s.authenticate(permanent.token))
+    }
+
     @Test fun `keys survive reload and can be revoked`() {
         val file = File(tmp.root, "keys.json")
         val a = store(file).create("a", Scope.READ)

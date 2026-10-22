@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import com.nbitslabs.thumbs.auth.ApiKeyStore
 import com.nbitslabs.thumbs.mcp.AuditEvent
+import com.nbitslabs.thumbs.safety.ConfirmMode
 import com.nbitslabs.thumbs.server.NetworkMode
 import com.nbitslabs.thumbs.server.ServerService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -102,6 +103,12 @@ class Settings(context: Context) {
     private val _keepAwake = MutableStateFlow(prefs.getBoolean(KEY_KEEP_AWAKE, true))
     val keepAwake: StateFlow<Boolean> = _keepAwake.asStateFlow()
 
+    private val _confirmMode = MutableStateFlow(
+        runCatching { ConfirmMode.valueOf(prefs.getString(KEY_CONFIRM, null) ?: "") }.getOrDefault(ConfirmMode.OFF),
+    )
+    /** Whether agents' actions need approval on the phone. Off by default. */
+    val confirmMode: StateFlow<ConfirmMode> = _confirmMode.asStateFlow()
+
     fun setServerEnabled(v: Boolean) {
         prefs.edit().putBoolean(KEY_ENABLED, v).apply()
         _serverEnabled.value = v
@@ -127,11 +134,17 @@ class Settings(context: Context) {
         _keepAwake.value = v
     }
 
+    fun setConfirmMode(v: ConfirmMode) {
+        prefs.edit().putString(KEY_CONFIRM, v.name).apply()
+        _confirmMode.value = v
+    }
+
     private companion object {
         const val KEY_ENABLED = "server_enabled"
         const val KEY_PORT = "port"
         const val KEY_NETWORK = "network_mode"
         const val KEY_AUTO_WAKE = "auto_wake"
         const val KEY_KEEP_AWAKE = "keep_awake"
+        const val KEY_CONFIRM = "confirm_mode"
     }
 }
