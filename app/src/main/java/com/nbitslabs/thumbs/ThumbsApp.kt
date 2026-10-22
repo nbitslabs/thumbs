@@ -99,6 +99,9 @@ class Settings(context: Context) {
     private val _autoWake = MutableStateFlow(prefs.getBoolean(KEY_AUTO_WAKE, true))
     val autoWake: StateFlow<Boolean> = _autoWake.asStateFlow()
 
+    private val _keepAwake = MutableStateFlow(prefs.getBoolean(KEY_KEEP_AWAKE, true))
+    val keepAwake: StateFlow<Boolean> = _keepAwake.asStateFlow()
+
     fun setServerEnabled(v: Boolean) {
         prefs.edit().putBoolean(KEY_ENABLED, v).apply()
         _serverEnabled.value = v
@@ -119,10 +122,16 @@ class Settings(context: Context) {
         _autoWake.value = v
     }
 
+    fun setKeepAwake(v: Boolean) {
+        prefs.edit().putBoolean(KEY_KEEP_AWAKE, v).apply()
+        _keepAwake.value = v
+    }
+
     private companion object {
         const val KEY_ENABLED = "server_enabled"
         const val KEY_PORT = "port"
         const val KEY_NETWORK = "network_mode"
         const val KEY_AUTO_WAKE = "auto_wake"
+        const val KEY_KEEP_AWAKE = "keep_awake"
     }
 }

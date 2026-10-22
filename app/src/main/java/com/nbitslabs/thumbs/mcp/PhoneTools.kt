@@ -13,6 +13,7 @@ import android.util.Base64
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction
+import com.nbitslabs.thumbs.Settings
 import com.nbitslabs.thumbs.auth.Scope
 import com.nbitslabs.thumbs.a11y.CoordinateSpace
 import com.nbitslabs.thumbs.a11y.Gestures
@@ -42,7 +43,7 @@ import java.io.ByteArrayOutputStream
  * coordinates. Control tools wait for the UI to settle before returning, and accept `observe`
  * to return a fresh UI tree and/or screenshot in the same round trip.
  */
-class PhoneTools(private val context: Context, private val autoWake: () -> Boolean) {
+class PhoneTools(private val context: Context, private val settings: Settings) {
 
     val instructions = """
         Thumbs controls an Android phone through its accessibility service.
@@ -79,7 +80,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             },
             scope = Scope.READ,
         ) { call ->
-            val svc = ThumbsAccessibilityService.require()
+            val svc = looking()
             val content = mutableListOf<Content>()
             content += screenshotContent(svc, call.string("format") ?: "jpeg", call.int("quality") ?: 75)
             if (call.bool("include_tree") == true) content += Content.Text(UiTree.snapshot(svc, space()).text)
@@ -97,7 +98,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             },
             scope = Scope.READ,
         ) { call ->
-            val svc = ThumbsAccessibilityService.require()
+            val svc = looking(wake = false)
             val snap = UiTree.snapshot(
                 svc,
                 space(),
@@ -121,7 +122,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             },
             scope = Scope.READ,
         ) { call ->
-            val svc = ThumbsAccessibilityService.require()
+            val svc = looking(wake = false)
             val query = call.requireString("query")
             val matches = UiTree.find(svc, query, call.bool("clickable_only") == true).take((call.int("limit") ?: 20).coerceIn(1, 200))
             if (matches.isEmpty()) {
@@ -554,6 +555,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         ) { call ->
             val svc = ThumbsAccessibilityService.require()
             val on = DeviceState.wake(svc)
+            holdScreen(svc)
             val locked = DeviceState.isLocked(context)
             val msg = when {
                 !on -> "Couldn't turn the screen on."
@@ -619,7 +621,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
 
     private fun notFoundHint(svc: ThumbsAccessibilityService): String =
         if (UiTree.opaqueApp(svc) != null) "The app in front exposes no accessibility info; use screenshot or read_screen_text and tap by x/y."
-        else "Visible labels: ${UiTree.visibleLabels(svc)}"
+        else "Visible labels: ${UiTree.visibleLabels(svc)}. Text drawn in images or canvases only shows up in read_screen_text."
 
     private fun boundsOf(node: AccessibilityNodeInfo) = Rect().also { node.getBoundsInScreen(it) }
     private fun center(node: AccessibilityNodeInfo): PointF = boundsOf(node).let { PointF(it.exactCenterX(), it.exactCenterY()) }
@@ -636,11 +638,40 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             throw ToolException("The Thumbs app is in front. For security, agents can't operate it; press_key home/back or open another app first.")
         }
         if (!DeviceState.isScreenOn(context)) {
-            if (!autoWake()) throw ToolException("The screen is off. Call wake_screen first.")
+            if (!settings.autoWake.value) throw ToolException("The screen is off. Call wake_screen first.")
             DeviceState.wake(svc)
             if (!DeviceState.isScreenOn(context)) throw ToolException("The screen is off and couldn't be woken.")
         }
+        holdScreen(svc)
         return svc
+    }
+
+    /**
+     * For tools that look at the screen: wakes it when [wake] and auto-wake allow (a screenshot
+     * of a sleeping screen is just black), and keeps it from sleeping while the agent works.
+     */
+    private suspend fun looking(wake: Boolean = true): ThumbsAccessibilityService {
+        val svc = ThumbsAccessibilityService.require()
+        if (wake && settings.autoWake.value && !DeviceState.isScreenOn(context)) DeviceState.wake(svc)
+        holdScreen(svc)
+        return svc
+    }
+
+    private fun holdScreen(svc: ThumbsAccessibilityService) {
+        if (settings.keepAwake.value && DeviceState.isScreenOn(context)) svc.keepScreenOn(KEEP_AWAKE_MS)
+    }
+
+    /**
+     * A screenshot, retried once when it comes back black: right after the screen wakes or
+     * stops dimming, the first frame is often still black.
+     */
+    private suspend fun capture(svc: ThumbsAccessibilityService): Bitmap {
+        val first = svc.screenshot()
+        if (!isBlank(first)) return first
+        first.recycle()
+        if (settings.autoWake.value && !DeviceState.isScreenOn(context)) DeviceState.wake(svc)
+        delay(BLANK_RETRY_DELAY_MS)
+        return svc.screenshot()
     }
 
     private fun header(svc: ThumbsAccessibilityService): String {
@@ -673,7 +704,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
     }
 
     private suspend fun screenshotContent(svc: ThumbsAccessibilityService, format: String, quality: Int): List<Content> {
-        val raw = svc.screenshot()
+        val raw = capture(svc)
         return withContext(Dispatchers.Default) {
             val sp = CoordinateSpace.forScreen(raw.width, raw.height)
             val scaled = if (sp.scale < 1.0) Bitmap.createScaledBitmap(raw, sp.width, sp.height, true) else raw
@@ -719,6 +750,10 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
     private companion object {
         /** Mean luminance change above which a scroll in an app without a tree counts as moving. */
         const val IMAGE_MOVED_THRESHOLD = 2.0
+
+        /** How long the screen is kept on after an agent's last look or action. */
+        const val KEEP_AWAKE_MS = 120_000L
+        const val BLANK_RETRY_DELAY_MS = 400L
 
         const val BLACK_SCREEN_NOTE = "Note: the screen is black. The screen is off, or the app in front blocks capture " +
             "(FLAG_SECURE, e.g. banking or password screens); get_ui_tree still works there."
@@ -824,7 +859,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         a.indices.sumOf { kotlin.math.abs(a[it] - b[it]) }.toDouble() / a.size
 
     private suspend fun readScreenText(call: ToolCall): ToolResult {
-        val svc = ThumbsAccessibilityService.require()
+        val svc = looking()
         val sp = space()
         val region = if (call.has("x1")) {
             Rect(
@@ -866,7 +901,7 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
         script: TextScript,
         granularity: TextGranularity,
     ): List<ScreenTextItem> {
-        val shot = svc.screenshot()
+        val shot = capture(svc)
         try {
             if (isBlank(shot)) throw ToolException(BLACK_SCREEN_NOTE)
             val crop = region?.let { Rect(it).takeIf { r -> r.intersect(0, 0, shot.width, shot.height) && !r.isEmpty } }
@@ -950,7 +985,8 @@ class PhoneTools(private val context: Context, private val autoWake: () -> Boole
             "headset_hook" -> AccessibilityService.GLOBAL_ACTION_KEYCODE_HEADSETHOOK
             else -> null
         }
-        val svc = if (key == "lock_screen" || key == "lock") ThumbsAccessibilityService.require() else ready(allowOwnApp = global != null)
+        val locking = key == "lock_screen" || key == "lock"
+        val svc = if (locking) ThumbsAccessibilityService.require().also { it.releaseScreenOn() } else ready(allowOwnApp = global != null)
         if (global != null) {
             val before = svc.currentPackage()
             repeat(if (key == "back") count else 1) {

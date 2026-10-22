@@ -59,7 +59,7 @@ class ServerService : LifecycleService() {
 
     private fun startServer(app: ThumbsApp) {
         val port = app.settings.port.value
-        val tools = PhoneTools(applicationContext) { app.settings.autoWake.value }
+        val tools = PhoneTools(applicationContext, app.settings)
         val toolList = tools.all()
         val mcp = McpServer(
             tools = { toolList },

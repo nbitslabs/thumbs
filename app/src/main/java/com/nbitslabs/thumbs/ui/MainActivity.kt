@@ -150,6 +150,7 @@ private fun MainScreen(app: ThumbsApp) {
     val port by app.settings.port.collectAsStateWithLifecycle()
     val networkMode by app.settings.networkMode.collectAsStateWithLifecycle()
     val autoWake by app.settings.autoWake.collectAsStateWithLifecycle()
+    val keepAwake by app.settings.keepAwake.collectAsStateWithLifecycle()
     val keys by app.keys.keys.collectAsStateWithLifecycle()
     val audit by app.audit.collectAsStateWithLifecycle()
 
@@ -270,13 +271,18 @@ private fun MainScreen(app: ThumbsApp) {
                     RadioRow("Tailscale only (recommended)", networkMode == NetworkMode.TAILSCALE_ONLY) { app.settings.setNetworkMode(NetworkMode.TAILSCALE_ONLY) }
                     RadioRow("Any network (Wi-Fi/LAN too; still needs a key)", networkMode == NetworkMode.ANY) { app.settings.setNetworkMode(NetworkMode.ANY) }
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("Wake screen for actions")
-                            Text("Turn the screen on automatically when an agent acts.", style = MaterialTheme.typography.bodySmall)
-                        }
-                        Switch(checked = autoWake, onCheckedChange = app.settings::setAutoWake)
-                    }
+                    SwitchRow(
+                        "Wake screen for agents",
+                        "Turn the screen on when an agent acts or takes a screenshot.",
+                        autoWake,
+                        app.settings::setAutoWake,
+                    )
+                    SwitchRow(
+                        "Keep screen on while agents work",
+                        "Stop the screen dimming or sleeping until 2 minutes after an agent's last step.",
+                        keepAwake,
+                        app.settings::setKeepAwake,
+                    )
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     PortSetting(port) { newPort ->
                         app.settings.setPort(newPort)
@@ -367,6 +373,17 @@ private fun KeyRow(key: ApiKey, onDelete: () -> Unit) {
             )
         }
         IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "Revoke ${key.name}") }
+    }
+}
+
+@Composable
+private fun SwitchRow(title: String, detail: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title)
+            Text(detail, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }
 

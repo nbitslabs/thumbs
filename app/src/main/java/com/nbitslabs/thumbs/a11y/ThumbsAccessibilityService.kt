@@ -3,8 +3,14 @@ package com.nbitslabs.thumbs.a11y
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -34,6 +40,10 @@ class ThumbsAccessibilityService : AccessibilityService() {
 
     private val screenshotLock = Mutex()
     private var lastScreenshotAt = 0L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var keepAwakeView: View? = null
+    private val releaseKeepAwake = Runnable { removeKeepAwake() }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -78,6 +88,7 @@ class ThumbsAccessibilityService : AccessibilityService() {
     }
 
     private fun clearInstance() {
+        mainHandler.post { removeKeepAwake() }
         if (instance === this) {
             instance = null
             _connected.value = false
@@ -120,6 +131,42 @@ class ThumbsAccessibilityService : AccessibilityService() {
             delay((quietMs - since).coerceIn(20, 100))
         }
         return false
+    }
+
+    // --- Keep awake ------------------------------------------------------------------------
+
+    /**
+     * Keeps the screen from dimming or timing out for [durationMs] from now (extending any
+     * current hold), using an invisible, untouchable overlay with FLAG_KEEP_SCREEN_ON. Agents
+     * often think for longer than the screen timeout between steps; without this the screen
+     * dims and then sleeps mid-task. It doesn't turn the screen on, and locking still works.
+     */
+    fun keepScreenOn(durationMs: Long) = mainHandler.post {
+        if (keepAwakeView == null) {
+            val view = View(this)
+            val params = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                PixelFormat.TRANSLUCENT,
+            ).apply { gravity = Gravity.TOP or Gravity.START }
+            runCatching { getSystemService(WindowManager::class.java).addView(view, params) }
+                .onSuccess { keepAwakeView = view }
+        }
+        mainHandler.removeCallbacks(releaseKeepAwake)
+        mainHandler.postDelayed(releaseKeepAwake, durationMs)
+    }
+
+    /** Ends a [keepScreenOn] hold now, e.g. when the agent locks the phone. */
+    fun releaseScreenOn() = mainHandler.post {
+        mainHandler.removeCallbacks(releaseKeepAwake)
+        removeKeepAwake()
+    }
+
+    private fun removeKeepAwake() {
+        keepAwakeView?.let { runCatching { getSystemService(WindowManager::class.java).removeView(it) } }
+        keepAwakeView = null
     }
 
     // --- Gestures --------------------------------------------------------------------------
