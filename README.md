@@ -46,7 +46,7 @@ Conventions:
 ## Phone setup
 
 1. Install Tailscale on the phone and connect it to your tailnet. In Android settings, set both Tailscale and Thumbs to **Unrestricted** battery usage; otherwise Doze cuts their network access while the phone is idle.
-2. Install Thumbs: `adb install app-debug.apk`, or build it yourself (see Development).
+2. Install Thumbs: download the newest APK from the [APK workflow](https://github.com/nbitslabs/thumbs/actions/workflows/apk.yml) (latest run → Artifacts; the last 7 builds of `master` are kept) and `adb install` it, or build it yourself (see Development).
 3. Open Thumbs and work through the setup card:
    - **Accessibility service.** If you installed the APK through a browser or file manager, Android 13+ greys out the toggle. Go to App info → ⋮ → *Allow restricted settings* first. Installing with `adb` avoids this.
    - **Notification access** (optional), **unrestricted battery**, and the **status notification**.
