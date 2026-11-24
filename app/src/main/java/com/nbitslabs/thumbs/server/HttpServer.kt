@@ -27,6 +27,7 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readRemaining
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
@@ -34,10 +35,12 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.transformWhile
+import kotlinx.coroutines.withContext
 import kotlinx.io.readByteArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.File
 import java.security.SecureRandom
 import java.util.Base64
 
@@ -59,6 +62,7 @@ class HttpServer(
     private val liveView: LiveView? = null,
     private val auditEvents: SharedFlow<AuditEvent>? = null,
     private val viewStatus: () -> JsonObject = { JsonObject(emptyMap()) },
+    private val clipFile: (String) -> File? = { null },
 ) {
     private val limiter = AuthFailureLimiter()
     private var server: EmbeddedServer<*, *>? = null
@@ -77,6 +81,7 @@ class HttpServer(
                     if (!gate(call)) return@delete
                     call.respond(HttpStatusCode.MethodNotAllowed)
                 }
+                get("/clips/{id}") { handleClip(call) }
                 get("/view") { handleViewPage(call) }
                 get("/view/stream") { handleViewStream(call) }
                 get("/view/events") { handleViewEvents(call) }
@@ -148,6 +153,36 @@ class HttpServer(
             call.respond(HttpStatusCode.Accepted)
         } else {
             call.respondText(response, ContentType.Application.Json)
+        }
+    }
+
+    private suspend fun handleClip(call: ApplicationCall) {
+        val key = authenticate(call) ?: return
+        onRequest(key.name)
+        val id = call.parameters["id"]
+        if (id == null || !CLIP_ID_REGEX.matches(id)) {
+            call.respond(HttpStatusCode.BadRequest)
+            return
+        }
+        val file = clipFile(id)
+        if (file == null || !file.isFile) {
+            call.respond(HttpStatusCode.NotFound)
+            return
+        }
+        noStore(call)
+        call.response.header(HttpHeaders.ContentDisposition, "inline; filename=\"$id.mp4\"")
+        call.respondBytesWriter(ContentType.Video.MP4) {
+            withContext(Dispatchers.IO) {
+                file.inputStream().use { input ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        writeFully(if (n == buf.size) buf else buf.copyOf(n))
+                    }
+                }
+            }
+            flush()
         }
     }
 
@@ -255,6 +290,7 @@ class HttpServer(
     companion object {
         private const val BOUNDARY = "thumbsframe"
         private const val STATUS_INTERVAL_MS = 3000L
+        private val CLIP_ID_REGEX = Regex("^[a-zA-Z0-9_-]{4,64}$")
         private val random = SecureRandom()
         const val DEFAULT_PORT = 8765
         private const val MAX_BODY = 1L shl 20

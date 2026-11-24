@@ -6,9 +6,13 @@ import android.content.Intent
 import android.util.Log
 import com.nbitslabs.thumbs.auth.ApiKeyStore
 import com.nbitslabs.thumbs.mcp.AuditEvent
+import com.nbitslabs.thumbs.record.ClipRecorder
+import com.nbitslabs.thumbs.record.WorkflowRecorder
 import com.nbitslabs.thumbs.safety.ConfirmMode
+import com.nbitslabs.thumbs.safety.PhoneLease
 import com.nbitslabs.thumbs.server.NetworkMode
 import com.nbitslabs.thumbs.server.ServerService
+import com.nbitslabs.thumbs.share.SharedInbox
 import com.nbitslabs.thumbs.view.LiveView
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -25,6 +29,14 @@ class ThumbsApp : Application() {
     lateinit var keys: ApiKeyStore
         private set
     lateinit var liveView: LiveView
+        private set
+    lateinit var sharedInbox: SharedInbox
+        private set
+    lateinit var phoneLease: PhoneLease
+        private set
+    lateinit var workflowRecorder: WorkflowRecorder
+        private set
+    lateinit var clipRecorder: ClipRecorder
         private set
 
     private val _audit = MutableStateFlow<List<AuditEvent>>(emptyList())
@@ -43,6 +55,10 @@ class ThumbsApp : Application() {
         settings = Settings(this)
         keys = ApiKeyStore(File(filesDir, "api_keys.json"))
         liveView = LiveView(keys)
+        sharedInbox = SharedInbox(File(filesDir, "shared_inbox.json"))
+        phoneLease = PhoneLease(isKeyActive = keys::isActive)
+        workflowRecorder = WorkflowRecorder(File(filesDir, "workflows"), selfPackage = packageName)
+        clipRecorder = ClipRecorder(File(filesDir, "clips"))
     }
 
     fun recordAudit(event: AuditEvent) {
@@ -71,6 +87,7 @@ class ThumbsApp : Application() {
 
     fun stopServer() {
         settings.setServerEnabled(false)
+        phoneLease.forceReleaseAll()
         stopService(Intent(this, ServerService::class.java))
     }
 

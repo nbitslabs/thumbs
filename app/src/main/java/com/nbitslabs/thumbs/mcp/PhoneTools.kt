@@ -16,6 +16,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction
 import com.nbitslabs.thumbs.Settings
 import com.nbitslabs.thumbs.auth.Scope
+import com.nbitslabs.thumbs.a11y.BurstCapture
 import com.nbitslabs.thumbs.a11y.CoordinateSpace
 import com.nbitslabs.thumbs.a11y.Gestures
 import com.nbitslabs.thumbs.a11y.ScreenText
@@ -30,14 +31,24 @@ import com.nbitslabs.thumbs.a11y.UiTree
 import com.nbitslabs.thumbs.device.Apps
 import com.nbitslabs.thumbs.device.DeviceState
 import com.nbitslabs.thumbs.device.NotificationListener
+import com.nbitslabs.thumbs.record.ClipRecorder
+import com.nbitslabs.thumbs.record.RecordedWorkflow
+import com.nbitslabs.thumbs.record.WorkflowRecorder
+import com.nbitslabs.thumbs.safety.AppPolicy
 import com.nbitslabs.thumbs.safety.Confirmations
+import com.nbitslabs.thumbs.safety.PhoneLease
 import com.nbitslabs.thumbs.safety.RiskyActions
 import com.nbitslabs.thumbs.server.AccessPolicy
+import com.nbitslabs.thumbs.share.SharedInbox
 import com.nbitslabs.thumbs.view.LiveView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import java.io.ByteArrayOutputStream
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * The MCP tools exposed to agents.
@@ -52,7 +63,12 @@ class PhoneTools(
     private val settings: Settings,
     private val confirmations: Confirmations,
     private val liveView: LiveView,
+    private val sharedInbox: SharedInbox,
+    private val phoneLease: PhoneLease,
+    private val workflowRecorder: WorkflowRecorder,
+    private val clipRecorder: ClipRecorder,
 ) {
+    private val prettyJson = Json { prettyPrint = true; encodeDefaults = true }
 
     val instructions = """
         Thumbs controls an Android phone through its accessibility service.
@@ -65,6 +81,16 @@ class PhoneTools(
 
         Text: tap a field (or pass its ref to type_text) before typing. scroll direction is the content you want to reveal ("down" shows what's below); swipe direction is finger motion.
 
+        Share-to-Thumbs: the owner can share links or text from any app via Android Share → Save to Thumbs; read them with get_shared_items and clear with clear_shared_items.
+
+        Motion & video: use capture_burst for a multi-frame JPEG storyboard (works with any key, no extra consent). For an MP4 clip, call record_clip (requires the owner to tap "Enable clip recording" in Thumbs first; download the returned /clips/<id> URL with your Bearer token).
+
+        Workflow recording: use start_recording / stop_recording (or the Thumbs app UI) to record a user's UI steps into a redacted step list (list_recordings, get_recording).
+
+        Phone lease: control tools automatically acquire a cooperative lease so multiple agents don't collide. Call acquire_phone to reserve a longer window and release_phone when you finish.
+
+        Research keys: keys with the RESEARCH scope can browse and navigate (within their allowed apps if configured) but hard-block risky actions (send, post, pay, delete, etc.) and high-privilege tools (start_intent, notification actions).
+
         Approval: the phone's owner can require on-device approval for some or all actions. Such a call waits (up to 45s) for them to answer; if it fails as declined, don't retry it unless the user asks.
 
         Safety: if the phone is locked with a PIN/password, ask the user to unlock it; never enter their PIN, passwords or 2FA codes unless they explicitly gave them to you for that purpose. Confirm with the user before sending messages, purchases, deleting data or changing security settings. Some screens (banking, password prompts) block screenshots; use get_ui_tree there.
@@ -72,7 +98,16 @@ class PhoneTools(
 
     private fun space() = CoordinateSpace.current(context)
 
-    fun all(): List<Tool> = tools().map { if (it.scope == Scope.CONTROL && it.name !in SELF_GUARDED) withConfirmation(it) else it }
+    fun all(): List<Tool> = tools().map { tool ->
+        var wrapped = tool
+        if (tool.scope == Scope.CONTROL && tool.name !in SELF_GUARDED && tool.name !in LEASE_TOOLS) {
+            wrapped = withConfirmation(wrapped)
+        }
+        if (tool.scope == Scope.CONTROL && tool.name !in LEASE_TOOLS) {
+            wrapped = withLease(wrapped)
+        }
+        wrapped
+    }
 
     private fun tools(): List<Tool> = listOf(
         // --- Observation ------------------------------------------------------------------
@@ -172,11 +207,9 @@ class PhoneTools(
             val minutes = (call.int("minutes") ?: 60).coerceIn(1, 1440)
             val (token, info) = liveView.createLink(call.key.id, call.key.name, minutes * 60_000L)
             val port = settings.port.value
-            val host = AccessPolicy.tailscaleAddresses().let { addrs ->
-                addrs.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: addrs.firstOrNull()?.let { "[${it.hostAddress}]" }
-            }
+            val host = tailscaleHost()
             val path = "/view?t=$token"
-            val expires = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT).format(java.util.Date(info.expiresAt))
+            val expires = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(info.expiresAt))
             ToolResult.text(
                 if (host != null) "Live view: http://$host:$port$path\nWorks for $minutes min (until $expires) from devices on the tailnet."
                 else "Tailscale isn't connected on the phone, so there's no tailnet address. With adb forwarding use http://127.0.0.1:$port$path (until $expires).",
@@ -262,7 +295,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val target = resolveTarget(svc, call)
             guardTouch(svc, call, "Tap", target)
             val msg = if (call.string("method") == "action") {
@@ -287,7 +320,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val target = resolveTarget(svc, call)
             guardTouch(svc, call, "Long-press", target)
             Gestures(svc).longPress(target.screenPoint, (call.int("duration_ms") ?: 800).toLong())
@@ -303,7 +336,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val target = resolveTarget(svc, call)
             guardTouch(svc, call, "Double-tap", target)
             Gestures(svc).doubleTap(target.screenPoint)
@@ -325,7 +358,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val sp = space()
             val (from, to) = if (call.has("x1")) {
                 PointF(sp.toScreenX(call.requireDouble("x1")), sp.toScreenY(call.requireDouble("y1"))) to
@@ -370,7 +403,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val sp = space()
             val from = call.string("from_ref")?.let { center(UiTree.resolveRef(it)) }
                 ?: PointF(sp.toScreenX(call.requireDouble("x1")), sp.toScreenY(call.requireDouble("y1")))
@@ -391,7 +424,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call)
             val sp = space()
             val target = resolveTarget(svc, call)
             val scale = call.requireDouble("scale").toFloat().coerceIn(0.1f, 10f)
@@ -437,6 +470,7 @@ class PhoneTools(
             logArgs = false,
         ) { call ->
             val svc = ThumbsAccessibilityService.require()
+            AppPolicy.checkForegroundApp(call.key, svc.currentPackage(), context.packageName)?.let { throw ToolException(it) }
             withContext(Dispatchers.Main) { TextInput(svc).setClipboard(call.requireString("text"), sensitive = true) }
             ToolResult.text("Clipboard set.")
         },
@@ -447,8 +481,9 @@ class PhoneTools(
             inputSchema = schema(),
             scope = Scope.CONTROL,
             exclusive = false,
-        ) { _ ->
+        ) { call ->
             val svc = ThumbsAccessibilityService.require()
+            AppPolicy.checkForegroundApp(call.key, svc.currentPackage(), context.packageName)?.let { throw ToolException(it) }
             val text = withContext(Dispatchers.Main) { runCatching { TextInput(svc).getClipboard() }.getOrNull() }
             if (text == null) ToolResult.error("Clipboard is empty or Android denied access (focus a text field and retry).") else ToolResult.text(text)
         },
@@ -485,9 +520,9 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
             val app = Apps.resolve(context, call.requireString("name"))
-            if (app.packageName == context.packageName) throw ToolException("Agents can't open the Thumbs app.")
+            AppPolicy.checkLaunchPackage(call.key, app.packageName, context.packageName)?.let { throw ToolException(it) }
+            val svc = ready(call, checkForeground = false, allowOwnApp = true)
             withContext(Dispatchers.Main) { Apps.launch(svc, app, call.bool("fresh") == true) }
             val deadline = SystemClock.uptimeMillis() + 8000
             while (svc.currentPackage() != app.packageName && SystemClock.uptimeMillis() < deadline) delay(150)
@@ -505,8 +540,10 @@ class PhoneTools(
             scope = Scope.CONTROL,
             logArgs = false,
         ) { call ->
-            val svc = ready()
-            withContext(Dispatchers.Main) { Apps.openUri(svc, call.requireString("url")) }
+            val url = call.requireString("url")
+            AppPolicy.checkOpenUrl(call.key, url)?.let { throw ToolException(it) }
+            val svc = ready(call, checkForeground = false, allowOwnApp = true)
+            withContext(Dispatchers.Main) { Apps.openUri(svc, url) }
             delay(500)
             finish(svc, call, "Opened URL")
         },
@@ -527,9 +564,19 @@ class PhoneTools(
             scope = Scope.CONTROL,
             destructive = true,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call, checkForeground = false)
             if (listOfNotNull(call.string("package"), call.string("component"), call.string("data")).any { it.contains(context.packageName) }) {
                 throw ToolException("Agents can't open the Thumbs app.")
+            }
+            call.string("package")?.let { pkg ->
+                AppPolicy.checkLaunchPackage(call.key, pkg, context.packageName)?.let { throw ToolException(it) }
+            }
+            val componentPkg = call.string("component")?.substringBefore('/')?.trim()?.takeIf { it.isNotEmpty() }
+            componentPkg?.let { pkg ->
+                AppPolicy.checkLaunchPackage(call.key, pkg, context.packageName)?.let { throw ToolException(it) }
+            }
+            if (call.key.allowedPackages.isNotEmpty() && call.string("package").isNullOrBlank() && componentPkg == null) {
+                throw ToolException("Blocked by key '${call.key.name}': start_intent requires an allowed package or component when this key restricts allowed apps (${call.key.allowedPackages.joinToString(", ")}).")
             }
             val extras = call.obj("extras")?.mapValues { (it.value as? kotlinx.serialization.json.JsonPrimitive)?.content ?: it.value.toString() } ?: emptyMap()
             if (confirmations.active) {
@@ -554,7 +601,7 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call ->
-            val svc = ready()
+            val svc = ready(call, checkForeground = false)
             NotificationListener.require().open(call.requireString("key"))
             delay(500)
             finish(svc, call, "Opened notification")
@@ -608,6 +655,261 @@ class PhoneTools(
                 else -> "Screen is on and unlocked."
             }
             finish(svc, call, msg)
+        },
+
+        // --- Share inbox ------------------------------------------------------------------
+        Tool(
+            name = "get_shared_items",
+            description = "Read items saved to Thumbs from Android's Share sheet (Share → Save to Thumbs), newest first, including extracted URLs.",
+            inputSchema = schema {
+                integer("limit", "Maximum items to return, 1-50 (default 20).")
+            },
+            scope = Scope.READ,
+        ) { call ->
+            val limit = (call.int("limit") ?: 20).coerceIn(1, 50)
+            val items = sharedInbox.list(limit)
+            if (items.isEmpty()) {
+                ToolResult.text("Shared inbox is empty. Use Android Share → Save to Thumbs from any app to send links or text here.")
+            } else {
+                val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                val out = items.joinToString("\n\n") { item ->
+                    buildString {
+                        append("id=").append(item.id)
+                        append(" · ").append(df.format(Date(item.receivedAt)))
+                        item.sourceApp?.let { append(" · from ").append(it) }
+                        item.subject?.let { append("\n  subject: ").append(it) }
+                        if (item.urls.isNotEmpty()) append("\n  urls: ").append(item.urls.joinToString(", "))
+                        append("\n  text: ").append(item.text)
+                    }
+                }
+                ToolResult.text(out)
+            }
+        },
+
+        Tool(
+            name = "clear_shared_items",
+            description = "Delete one item by id, or clear all items from the Share-to-Thumbs inbox.",
+            inputSchema = schema {
+                string("id", "Optional shared item id to delete. Omit to clear all items.")
+            },
+            scope = Scope.CONTROL,
+            destructive = true,
+            exclusive = false,
+        ) { call ->
+            val id = call.string("id")?.trim()?.takeIf { it.isNotEmpty() }
+            if (id != null) {
+                if (sharedInbox.delete(id)) ToolResult.text("Deleted shared item '$id'.")
+                else throw ToolException("No shared item with id '$id'.")
+            } else {
+                val removed = sharedInbox.clear()
+                ToolResult.text("Cleared $removed shared item(s).")
+            }
+        },
+
+        // --- Storyboard burst -------------------------------------------------------------
+        Tool(
+            name = "capture_burst",
+            description = "Capture a timed burst of screenshots and stitch them into a single JPEG storyboard grid with timestamp badges (t+0.0s, ...). Useful for analysing animations, transitions, and video playback.",
+            inputSchema = schema {
+                integer("frames", "Number of frames to capture, 2-12 (default 6).")
+                integer("interval_ms", "Milliseconds between frames, 400-3000 (default 600).")
+                integer("quality", "JPEG quality, 30-95 (default 70).")
+            },
+            scope = Scope.READ,
+        ) { call ->
+            val svc = looking()
+            val burst = BurstCapture.captureStoryboard(
+                svc = svc,
+                frames = call.int("frames") ?: 6,
+                intervalMs = (call.int("interval_ms") ?: 600).toLong(),
+                quality = call.int("quality") ?: 70,
+            )
+            val b64 = Base64.encodeToString(burst.jpeg, Base64.NO_WRAP)
+            val stamps = burst.timestampsMs.joinToString(", ") { String.format(Locale.US, "t+%.1fs", it / 1000.0) }
+            val summary = "Captured ${burst.framesCaptured} frames in a ${burst.columns}x${burst.rows} grid over ${burst.durationMs}ms ($stamps).\n${header(svc)}"
+            ToolResult(listOf(Content.Image(b64, "image/jpeg"), Content.Text(summary)))
+        },
+
+        // --- Phone lease ------------------------------------------------------------------
+        Tool(
+            name = "acquire_phone",
+            description = "Acquire or renew the cooperative phone control lease so other agents know the phone is busy. Control tools also auto-acquire a 90s idle lease.",
+            inputSchema = schema {
+                integer("ttl_seconds", "Lease duration in seconds, 10-600 (default 90).")
+            },
+            scope = Scope.CONTROL,
+            exclusive = false,
+        ) { call ->
+            val ttlMs = call.int("ttl_seconds")?.let { it.toLong() * 1000L }
+            val info = phoneLease.acquire(call.key, ttlMs).getOrElse { throw ToolException(it.message ?: "Phone is busy.") }
+            val remainingSec = ((info.expiresAt - System.currentTimeMillis()).coerceAtLeast(0L) + 999L) / 1000L
+            ToolResult.text("Phone lease acquired for '${info.keyName}' (expires in ${remainingSec}s).")
+        },
+
+        Tool(
+            name = "release_phone",
+            description = "Release your cooperative phone control lease so other agents can use the phone immediately.",
+            inputSchema = schema(),
+            scope = Scope.CONTROL,
+            exclusive = false,
+        ) { call ->
+            if (phoneLease.release(call.key)) {
+                ToolResult.text("Released phone lease.")
+            } else {
+                val active = phoneLease.current()
+                if (active != null && active.keyId != call.key.id) {
+                    ToolResult.error("Phone lease is held by '${active.keyName}'; you can only release your own lease.")
+                } else {
+                    ToolResult.text("No active phone lease to release.")
+                }
+            }
+        },
+
+        // --- Workflow recorder ------------------------------------------------------------
+        Tool(
+            name = "start_recording",
+            description = "Start recording user UI interactions (app switches, taps, scrolls, redacted text inputs) into a reusable workflow trace. Passwords and typed values are never stored.",
+            inputSchema = schema {
+                string("name", "Optional name for the workflow recording.")
+            },
+            scope = Scope.CONTROL,
+            exclusive = false,
+        ) { call ->
+            val id = try {
+                workflowRecorder.start(call.string("name"))
+            } catch (e: IllegalStateException) {
+                throw ToolException(e.message ?: "Workflow recording is already active.")
+            }
+            ToolResult.text("Started workflow recording '$id'. Perform the steps on the phone, then call stop_recording.")
+        },
+
+        Tool(
+            name = "stop_recording",
+            description = "Stop the active workflow recording, save it, and return the recorded steps as Markdown.",
+            inputSchema = schema(),
+            scope = Scope.CONTROL,
+            exclusive = false,
+        ) { _ ->
+            val wf = workflowRecorder.stop() ?: throw ToolException("No workflow recording is currently active.")
+            ToolResult.text(workflowRecorder.formatAsMarkdown(wf))
+        },
+
+        Tool(
+            name = "list_recordings",
+            description = "List saved workflow recordings (newest first).",
+            inputSchema = schema(),
+            scope = Scope.READ,
+        ) { _ ->
+            val list = workflowRecorder.list()
+            if (list.isEmpty()) {
+                ToolResult.text("No saved workflow recordings.")
+            } else {
+                val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                val out = list.joinToString("\n") { wf ->
+                    val dur = String.format(Locale.US, "%.1fs", (wf.stoppedAt - wf.startedAt).coerceAtLeast(0L) / 1000.0)
+                    "${wf.id}\t${wf.name}\t${wf.steps.size} step(s)\t$dur\t${df.format(Date(wf.startedAt))}"
+                }
+                ToolResult.text(out)
+            }
+        },
+
+        Tool(
+            name = "get_recording",
+            description = "Get a saved workflow recording by id, formatted as Markdown (default) or JSON.",
+            inputSchema = schema {
+                string("id", "Workflow recording id.", required = true)
+                string("format", "Output format: markdown (default) or json.", enum = listOf("markdown", "json"))
+            },
+            scope = Scope.READ,
+        ) { call ->
+            val id = call.requireString("id")
+            val wf = workflowRecorder.get(id) ?: throw ToolException("No workflow recording with id '$id'.")
+            val text = if (call.string("format") == "json") {
+                prettyJson.encodeToString(RecordedWorkflow.serializer(), wf)
+            } else {
+                workflowRecorder.formatAsMarkdown(wf)
+            }
+            ToolResult.text(text)
+        },
+
+        Tool(
+            name = "delete_recording",
+            description = "Delete a saved workflow recording by id.",
+            inputSchema = schema {
+                string("id", "Workflow recording id to delete.", required = true)
+            },
+            scope = Scope.CONTROL,
+            destructive = true,
+            exclusive = false,
+        ) { call ->
+            val id = call.requireString("id")
+            if (workflowRecorder.delete(id)) ToolResult.text("Deleted workflow recording '$id'.")
+            else throw ToolException("No workflow recording with id '$id'.")
+        },
+
+        // --- Clip recorder ----------------------------------------------------------------
+        Tool(
+            name = "record_clip",
+            description = "Record a bounded video-only MP4 screen clip (3-30s) and return its metadata and authenticated download URL. Requires the owner to tap 'Enable clip recording' in the Thumbs app first.",
+            inputSchema = schema {
+                integer("duration_sec", "Clip duration in seconds, 3-30 (default 10).")
+                integer("fps", "Frame rate, 15-30 (default 24).")
+                integer("max_short_edge", "Max short-edge resolution in pixels, 360-720 (default 720).")
+            },
+            scope = Scope.CONTROL,
+        ) { call ->
+            ThumbsAccessibilityService.instance?.let { holdScreen(it) }
+            val meta = clipRecorder.recordClip(
+                context = context,
+                durationSec = call.int("duration_sec") ?: 10,
+                fps = call.int("fps") ?: 24,
+                maxShortEdge = call.int("max_short_edge") ?: 720,
+            )
+            val url = clipUrl(meta.id)
+            val durSec = String.format(Locale.US, "%.1fs", meta.durationMs / 1000.0)
+            val sizeKb = (meta.sizeBytes + 1023L) / 1024L
+            ToolResult.text(
+                buildString {
+                    appendLine("Recorded clip ${meta.id}")
+                    appendLine("Resolution: ${meta.width}x${meta.height} @ ${meta.fps}fps · duration: $durSec · size: ${sizeKb}KB (${meta.sizeBytes} bytes) · audio: ${meta.hasAudio}")
+                    append("Download URL (requires Authorization: Bearer <key>): $url")
+                },
+            )
+        },
+
+        Tool(
+            name = "list_clips",
+            description = "List saved MP4 screen clips (newest first) with their authenticated download URLs.",
+            inputSchema = schema(),
+            scope = Scope.READ,
+        ) { _ ->
+            val clips = clipRecorder.list()
+            if (clips.isEmpty()) {
+                ToolResult.text("No saved clips.")
+            } else {
+                val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                val out = clips.joinToString("\n") { c ->
+                    val durSec = String.format(Locale.US, "%.1fs", c.durationMs / 1000.0)
+                    val sizeKb = (c.sizeBytes + 1023L) / 1024L
+                    "${c.id}\t${c.width}x${c.height}@${c.fps}fps\t$durSec\t${sizeKb}KB\t${df.format(Date(c.createdAt))}\t${clipUrl(c.id)}"
+                }
+                ToolResult.text(out)
+            }
+        },
+
+        Tool(
+            name = "delete_clip",
+            description = "Delete a saved MP4 screen clip by id.",
+            inputSchema = schema {
+                string("id", "Clip id to delete.", required = true)
+            },
+            scope = Scope.CONTROL,
+            destructive = true,
+            exclusive = false,
+        ) { call ->
+            val id = call.requireString("id")
+            if (clipRecorder.delete(id)) ToolResult.text("Deleted clip '$id'.")
+            else throw ToolException("No clip with id '$id'.")
         },
     )
 
@@ -663,7 +965,42 @@ class PhoneTools(
         throw ToolException("Specify a target: ref, text, or x and y.")
     }
 
-    // --- Confirmation (opt-in, see Settings) -------------------------------------------------
+    // --- Lease & confirmation (opt-in, see Settings) -----------------------------------------
+
+    private fun withLease(tool: Tool) = Tool(
+        name = tool.name,
+        description = tool.description,
+        inputSchema = tool.inputSchema,
+        scope = tool.scope,
+        readOnly = tool.readOnly,
+        destructive = tool.destructive,
+        exclusive = tool.exclusive,
+        logArgs = tool.logArgs,
+    ) { call ->
+        phoneLease.touchOrAcquire(call.key)?.let { throw ToolException(it) }
+        tool.handler(call)
+    }
+
+    private fun precheckPolicy(toolName: String, call: ToolCall) {
+        when (toolName) {
+            in FOREGROUND_GUARDED_TOOLS -> {
+                ThumbsAccessibilityService.instance?.let { svc ->
+                    AppPolicy.checkForegroundApp(call.key, svc.currentPackage(), context.packageName)?.let { throw ToolException(it) }
+                }
+            }
+            "open_app" -> {
+                call.string("name")?.let { name ->
+                    val app = Apps.resolve(context, name)
+                    AppPolicy.checkLaunchPackage(call.key, app.packageName, context.packageName)?.let { throw ToolException(it) }
+                }
+            }
+            "open_url" -> {
+                call.string("url")?.let { url ->
+                    AppPolicy.checkOpenUrl(call.key, url)?.let { throw ToolException(it) }
+                }
+            }
+        }
+    }
 
     private suspend fun guard(svc: ThumbsAccessibilityService, call: ToolCall, action: String, risky: Boolean) =
         confirmations.check(svc, call.key, action, risky)
@@ -680,6 +1017,7 @@ class PhoneTools(
         logArgs = tool.logArgs,
     ) { call ->
         if (confirmations.needsAsking(call.key, risky = false)) {
+            precheckPolicy(tool.name, call)
             val args = call.args.entries.filter { it.key != "observe" }.joinToString(", ") { (k, v) ->
                 "$k=${clip((v as? kotlinx.serialization.json.JsonPrimitive)?.content ?: v.toString(), 200)}"
             }
@@ -690,10 +1028,17 @@ class PhoneTools(
     }
 
     private suspend fun guardTouch(svc: ThumbsAccessibilityService, call: ToolCall, verb: String, target: Target) {
-        if (!confirmations.active) return
+        val isResearch = call.key.scope == Scope.RESEARCH
+        if (!isResearch && !confirmations.active) return
         val labels = targetLabels(svc, target)
         val what = labels.firstOrNull()?.let { "\u201c${clip(it, 60)}\u201d" } ?: target.label
-        guard(svc, call, "$verb $what in ${appName(svc)}", RiskyActions.match(labels) != null)
+        val action = "$verb $what in ${appName(svc)}"
+        if (isResearch) {
+            AppPolicy.checkRiskyActionForResearch(call.key, action, labels)?.let { throw ToolException(it) }
+        }
+        if (confirmations.active) {
+            guard(svc, call, action, RiskyActions.match(labels) != null)
+        }
     }
 
     private suspend fun guardNotificationAction(listener: NotificationListener, call: ToolCall) {
@@ -761,6 +1106,18 @@ class PhoneTools(
         }.map { it.text }.take(3)
     }
 
+    /** Labels describing what submitting the currently focused input field would do (for research-key checks). */
+    private fun submitRiskLabels(svc: ThumbsAccessibilityService): List<String> {
+        val field = svc.focusedInput()
+        val imeActionLabel = if (Build.VERSION.SDK_INT >= 33) svc.inputMethod?.currentInputEditorInfo?.actionLabel?.toString() else null
+        return buildList {
+            if (imeSends(svc)) add("send")
+            imeActionLabel?.let { add(it) }
+            field?.hintText?.toString()?.let { add(it) }
+            field?.contentDescription?.toString()?.let { add(it) }
+        }
+    }
+
     /** Whether the focused field's keyboard action is "send" (e.g. a chat box). */
     private fun imeSends(svc: ThumbsAccessibilityService): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
@@ -784,15 +1141,33 @@ class PhoneTools(
     private fun boundsOf(node: AccessibilityNodeInfo) = Rect().also { node.getBoundsInScreen(it) }
     private fun center(node: AccessibilityNodeInfo): PointF = boundsOf(node).let { PointF(it.exactCenterX(), it.exactCenterY()) }
 
+    private fun tailscaleHost(): String? = AccessPolicy.tailscaleAddresses().let { addrs ->
+        addrs.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: addrs.firstOrNull()?.let { "[${it.hostAddress}]" }
+    }
+
+    private fun clipUrl(id: String): String {
+        val port = settings.port.value
+        val host = tailscaleHost() ?: "127.0.0.1"
+        return "http://$host:$port/clips/$id"
+    }
+
     /**
-     * Ensures the service is connected and the screen is on before driving the UI.
+     * Ensures the service is connected, app policy allows operating on the foreground app,
+     * and the screen is on before driving the UI.
      *
      * Agents may never operate the Thumbs app itself: from there they could mint API keys or
-     * widen network access. Only system navigation (home/back/…) is allowed to leave it.
+     * widen network access. Only system navigation (home/back/…) or launching another app is
+     * allowed to leave it.
      */
-    private suspend fun ready(allowOwnApp: Boolean = false): ThumbsAccessibilityService {
+    private suspend fun ready(
+        call: ToolCall,
+        checkForeground: Boolean = true,
+        allowOwnApp: Boolean = false,
+    ): ThumbsAccessibilityService {
         val svc = ThumbsAccessibilityService.require()
-        if (!allowOwnApp && svc.currentPackage() == context.packageName) {
+        if (checkForeground) {
+            AppPolicy.checkForegroundApp(call.key, svc.currentPackage(), context.packageName)?.let { throw ToolException(it) }
+        } else if (!allowOwnApp && svc.currentPackage() == context.packageName) {
             throw ToolException("The Thumbs app is in front. For security, agents can't operate it; press_key home/back or open another app first.")
         }
         if (!DeviceState.isScreenOn(context)) {
@@ -913,6 +1288,21 @@ class PhoneTools(
         /** Control tools that ask for confirmation themselves, with a description of what they'll touch. */
         val SELF_GUARDED = setOf("tap", "long_press", "double_tap", "type_text", "press_key", "element_action", "notification_action", "start_intent")
 
+        /** Tools that manage the cooperative lease directly and bypass auto-lease / confirmation wrappers. */
+        val LEASE_TOOLS = setOf("acquire_phone", "release_phone")
+
+        /** UI control tools that operate on the foreground app and must satisfy AppPolicy.checkForegroundApp. */
+        val FOREGROUND_GUARDED_TOOLS = setOf(
+            "tap", "long_press", "double_tap", "swipe", "scroll", "drag", "pinch",
+            "element_action", "type_text", "set_clipboard", "get_clipboard",
+        )
+
+        /** System shade / power keys blocked for Scope.RESEARCH keys. */
+        val RESEARCH_BLOCKED_KEYS = setOf(
+            "notifications", "quick_settings", "dismiss_notifications", "dismiss_notification_shade",
+            "power_dialog", "power",
+        )
+
         /** How long the screen is kept on after an agent's last look or action. */
         const val KEEP_AWAKE_MS = 120_000L
         const val BLANK_RETRY_DELAY_MS = 400L
@@ -931,7 +1321,7 @@ class PhoneTools(
     }
 
     private suspend fun scroll(call: ToolCall): ToolResult {
-        val svc = ready()
+        val svc = ready(call)
         val sp = space()
         val dir = call.requireString("direction")
         val amount = (call.double("amount") ?: 0.6).coerceIn(0.1, 0.95)
@@ -1078,17 +1468,23 @@ class PhoneTools(
         if (text.any { Character.UnicodeScript.of(it.code) in CJK_SCRIPTS }) TextScript.CHINESE else TextScript.LATIN
 
     private suspend fun typeText(call: ToolCall): ToolResult {
-        val svc = ready()
+        val svc = ready(call)
         val input = TextInput(svc)
         val fieldNode = call.string("ref")?.let { UiTree.resolveRef(it) }
             ?: call.string("target_text")?.let { q ->
                 UiTree.find(svc, q).firstOrNull { it.isEditable } ?: UiTree.find(svc, q).firstOrNull()
                     ?: throw ToolException("No field matches '$q'.")
             }
+        val isResearch = call.key.scope == Scope.RESEARCH
         if (fieldNode == null) {
             // The field may still be appearing (e.g. a search screen opening after a tap)
             awaitFocusedField(svc, input, 2000)
         } else if (!fieldNode.isFocused) {
+            if (isResearch) {
+                val labels = controlLabels(fieldNode)
+                val what = labels.firstOrNull()?.let { "\u201c${clip(it, 60)}\u201d" } ?: "field"
+                AppPolicy.checkRiskyActionForResearch(call.key, "Tap $what in ${appName(svc)}", labels)?.let { throw ToolException(it) }
+            }
             // A real tap focuses and brings up the IME, which ACTION_FOCUS alone doesn't always do
             Gestures(svc).tap(center(fieldNode))
             val deadline = SystemClock.uptimeMillis() + 1500
@@ -1104,8 +1500,13 @@ class PhoneTools(
             else -> TypeMethod.AUTO
         }
         val text = call.requireString("text")
+        val submit = call.bool("submit") == true
+        if (isResearch && submit) {
+            val fieldLabel = svc.focusedInput()?.let { f -> listOfNotNull(f.hintText, f.contentDescription, f.viewIdResourceName?.substringAfter(":id/")).firstOrNull()?.toString() }
+            val action = "Type and submit${fieldLabel?.let { " into \u201c${clip(it, 40)}\u201d" } ?: ""} in ${appName(svc)}"
+            AppPolicy.checkRiskyActionForResearch(call.key, action, submitRiskLabels(svc))?.let { throw ToolException(it) }
+        }
         if (confirmations.active) {
-            val submit = call.bool("submit") == true
             val field = svc.focusedInput()?.let { f -> listOfNotNull(f.hintText, f.contentDescription, f.viewIdResourceName?.substringAfter(":id/")).firstOrNull()?.toString() }
             val verb = if (submit) "Type and submit" else "Type"
             guard(svc, call, "$verb${field?.let { " into \u201c${clip(it, 40)}\u201d" } ?: ""} in ${appName(svc)}: \u201c${clip(text, 300)}\u201d", submit && imeSends(svc))
@@ -1137,6 +1538,9 @@ class PhoneTools(
     private suspend fun pressKey(call: ToolCall): ToolResult {
         val raw = call.requireString("key").trim()
         val key = raw.lowercase().replace('-', '_').replace(' ', '_')
+        if (call.key.scope == Scope.RESEARCH && key in RESEARCH_BLOCKED_KEYS) {
+            throw ToolException("Blocked by research-only key '${call.key.name}': key '$raw' is not permitted.")
+        }
         val count = (call.int("count") ?: 1).coerceIn(1, 200)
         val global = when (key) {
             "back" -> AccessibilityService.GLOBAL_ACTION_BACK
@@ -1153,10 +1557,22 @@ class PhoneTools(
             "headset_hook" -> AccessibilityService.GLOBAL_ACTION_KEYCODE_HEADSETHOOK
             else -> null
         }
+        val escapeKey = AppPolicy.isEscapeKey(key) || key in setOf("app_switch", "overview")
         val locking = key == "lock_screen" || key == "lock"
-        val svc = if (locking) ThumbsAccessibilityService.require().also { it.releaseScreenOn() } else ready(allowOwnApp = global != null)
+        val svc = if (locking) {
+            ThumbsAccessibilityService.require().also { svc ->
+                AppPolicy.checkForegroundApp(call.key, svc.currentPackage(), context.packageName)?.let { throw ToolException(it) }
+                svc.releaseScreenOn()
+            }
+        } else {
+            ready(call, checkForeground = !escapeKey, allowOwnApp = escapeKey || global != null)
+        }
+        val enter = key == "enter" || key.endsWith("+enter") || key == "keycode_enter" ||
+            key == "numpad_enter" || key.endsWith("+numpad_enter") || key == "keycode_numpad_enter"
+        if (!locking && call.key.scope == Scope.RESEARCH && enter) {
+            AppPolicy.checkRiskyActionForResearch(call.key, "Press $raw in ${appName(svc)}", submitRiskLabels(svc))?.let { throw ToolException(it) }
+        }
         if (!locking && confirmations.active) {
-            val enter = key == "enter" || key.endsWith("+enter") || key == "keycode_enter"
             guard(svc, call, "Press $raw in ${appName(svc)}", enter && imeSends(svc))
         }
         if (global != null) {
@@ -1219,14 +1635,22 @@ class PhoneTools(
     }
 
     private suspend fun elementAction(call: ToolCall): ToolResult {
-        val svc = ready()
+        val svc = ready(call)
         val node = UiTree.resolveRef(call.requireString("ref"))
         val action = call.requireString("action")
-        if (confirmations.active) {
+        val isResearch = call.key.scope == Scope.RESEARCH
+        if (isResearch || confirmations.active) {
             val labels = controlLabels(node)
             val what = labels.firstOrNull()?.let { "\u201c${clip(it, 60)}\u201d" } ?: call.requireString("ref")
-            val risky = action in setOf("click", "long_click", "dismiss") && RiskyActions.match(labels) != null
-            guard(svc, call, "${action.replace('_', ' ').replaceFirstChar(Char::uppercase)} $what in ${appName(svc)}", risky)
+            val desc = "${action.replace('_', ' ').replaceFirstChar(Char::uppercase)} $what in ${appName(svc)}"
+            val riskyActionType = action in setOf("click", "long_click", "dismiss")
+            if (isResearch && riskyActionType) {
+                AppPolicy.checkRiskyActionForResearch(call.key, desc, labels)?.let { throw ToolException(it) }
+            }
+            if (confirmations.active) {
+                val risky = riskyActionType && RiskyActions.match(labels) != null
+                guard(svc, call, desc, risky)
+            }
         }
         val ok = when (action) {
             "click" -> (UiTree.clickableAncestor(node) ?: node).performAction(AccessibilityNodeInfo.ACTION_CLICK)
@@ -1294,6 +1718,29 @@ class PhoneTools(
             add("Notification access: ${if (NotificationListener.instance != null) "granted" else "not granted (notification tools unavailable)"}")
             add("IME input (Android 13+): ${if (Build.VERSION.SDK_INT >= 33) "available" else "unavailable; typing uses ACTION_SET_TEXT"}")
             add("Tailscale addresses: ${AccessPolicy.tailscaleAddresses().joinToString { it.hostAddress ?: "" }.ifEmpty { "none" }}")
+            val lease = phoneLease.current()
+            add(
+                if (lease != null) {
+                    val leftSec = ((lease.expiresAt - System.currentTimeMillis()).coerceAtLeast(0L) + 999L) / 1000L
+                    "Phone lease: held by '${lease.keyName}' (expires in ${leftSec}s)"
+                } else {
+                    "Phone lease: free"
+                },
+            )
+            add(
+                if (workflowRecorder.recording.value) {
+                    "Workflow recording: active (${workflowRecorder.activeName.value ?: "workflow"}, ${workflowRecorder.activeStepCount.value} step(s))"
+                } else {
+                    "Workflow recording: idle (${workflowRecorder.workflows.value.size} saved)"
+                },
+            )
+            val clipStatus = when {
+                clipRecorder.isRecording.value -> "recording"
+                clipRecorder.sessionReady.value -> "ready"
+                else -> "not enabled"
+            }
+            add("Clip recording: $clipStatus (${clipRecorder.clips.value.size} saved)")
+            add("Shared inbox: ${sharedInbox.items.value.size} item(s)")
         }
         return ToolResult.text(lines.joinToString("\n"))
     }

@@ -71,7 +71,16 @@ class ServerService : LifecycleService() {
 
     private fun startServer(app: ThumbsApp) {
         val port = app.settings.port.value
-        val tools = PhoneTools(applicationContext, app.settings, Confirmations(applicationContext, { app.settings.confirmMode.value }), app.liveView)
+        val tools = PhoneTools(
+            applicationContext,
+            app.settings,
+            Confirmations(applicationContext, { app.settings.confirmMode.value }),
+            app.liveView,
+            app.sharedInbox,
+            app.phoneLease,
+            app.workflowRecorder,
+            app.clipRecorder,
+        )
         val toolList = tools.all()
         val mcp = McpServer(
             tools = { toolList },
@@ -84,6 +93,7 @@ class ServerService : LifecycleService() {
             liveView = app.liveView,
             auditEvents = app.auditEvents,
             viewStatus = ::viewStatus,
+            clipFile = app.clipRecorder::getFile,
         )
         try {
             http.start()
@@ -156,7 +166,9 @@ class ServerService : LifecycleService() {
     override fun onDestroy() {
         server?.stop()
         server = null
-        ThumbsApp.get(this).updateStatus { it.copy(running = false) }
+        val app = ThumbsApp.get(this)
+        app.phoneLease.forceReleaseAll()
+        app.updateStatus { it.copy(running = false) }
         super.onDestroy()
     }
 

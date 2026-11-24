@@ -1,7 +1,7 @@
 package com.nbitslabs.thumbs.mcp
 
 import com.nbitslabs.thumbs.auth.ApiKey
-import com.nbitslabs.thumbs.auth.Scope
+import com.nbitslabs.thumbs.safety.AppPolicy
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -106,7 +106,7 @@ class McpServer(
         }
     }
 
-    private fun visibleTools(key: ApiKey) = tools().filter { key.scope == Scope.CONTROL || it.scope == Scope.READ }
+    private fun visibleTools(key: ApiKey) = tools().filter { AppPolicy.checkToolForScope(key, it.name, it.scope) == null }
 
     private fun listTools(key: ApiKey) = buildJsonObject {
         put("tools", buildJsonArray { visibleTools(key).forEach { add(it.descriptor()) } })
@@ -121,8 +121,9 @@ class McpServer(
         }
         val tool = tools().firstOrNull { it.name == name } ?: throw RpcException(INVALID_PARAMS, "Unknown tool: $name")
         val start = clock()
-        val result = if (tool.scope == Scope.CONTROL && key.scope != Scope.CONTROL) {
-            ToolResult.error("The API key '${key.name}' is read-only and can't call '$name'.")
+        val scopeError = AppPolicy.checkToolForScope(key, tool.name, tool.scope)
+        val result = if (scopeError != null) {
+            ToolResult.error(scopeError)
         } else {
             try {
                 val call = ToolCall(args, key)

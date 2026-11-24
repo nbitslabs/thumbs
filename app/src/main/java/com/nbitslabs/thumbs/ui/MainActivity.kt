@@ -91,6 +91,8 @@ import com.nbitslabs.thumbs.auth.CreatedKey
 import com.nbitslabs.thumbs.auth.Scope
 import com.nbitslabs.thumbs.device.NotificationListener
 import com.nbitslabs.thumbs.mcp.AuditEvent
+import com.nbitslabs.thumbs.record.ClipConsentActivity
+import com.nbitslabs.thumbs.record.ClipRecordingService
 import com.nbitslabs.thumbs.safety.ConfirmMode
 import com.nbitslabs.thumbs.server.AccessPolicy
 import com.nbitslabs.thumbs.server.NetworkMode
@@ -142,6 +144,7 @@ private fun MainScreen(app: ThumbsApp) {
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         setup = readSetup(context)
         addresses = AccessPolicy.localAddresses()
+        app.phoneLease.current()
     }
     val a11yConnected by ThumbsAccessibilityService.connected.collectAsStateWithLifecycle()
     LaunchedEffect(a11yConnected) { setup = readSetup(context) }
@@ -156,6 +159,15 @@ private fun MainScreen(app: ThumbsApp) {
     val keys by app.keys.keys.collectAsStateWithLifecycle()
     val audit by app.audit.collectAsStateWithLifecycle()
     val viewers by app.liveView.viewers.collectAsStateWithLifecycle()
+    val lease by app.phoneLease.state.collectAsStateWithLifecycle()
+    val sharedItems by app.sharedInbox.items.collectAsStateWithLifecycle()
+    val wfRecording by app.workflowRecorder.recording.collectAsStateWithLifecycle()
+    val wfActiveName by app.workflowRecorder.activeName.collectAsStateWithLifecycle()
+    val wfStepCount by app.workflowRecorder.activeStepCount.collectAsStateWithLifecycle()
+    val workflows by app.workflowRecorder.workflows.collectAsStateWithLifecycle()
+    val clipReady by app.clipRecorder.sessionReady.collectAsStateWithLifecycle()
+    val clipRecording by app.clipRecorder.isRecording.collectAsStateWithLifecycle()
+    val clips by app.clipRecorder.clips.collectAsStateWithLifecycle()
     var viewLink by remember { mutableStateOf<String?>(null) }
 
     var showCreate by remember { mutableStateOf(false) }
@@ -215,6 +227,24 @@ private fun MainScreen(app: ThumbsApp) {
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    val activeLease = lease?.takeIf { it.expiresAt > System.currentTimeMillis() }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Phone lease", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                if (activeLease != null) {
+                                    "Held by ${activeLease.keyName} until ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(activeLease.expiresAt))}"
+                                } else {
+                                    "Free"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        if (activeLease != null) {
+                            OutlinedButton(onClick = { app.phoneLease.forceReleaseAll() }) { Text("Release") }
+                        }
+                    }
                 }
             }
 
@@ -240,6 +270,71 @@ private fun MainScreen(app: ThumbsApp) {
                             app.liveView.endAll()
                             viewLink = null
                         }) { Text("End all live views") }
+                    }
+                }
+            }
+
+            item {
+                Section("Recorders & Inbox") {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Workflow recorder", fontWeight = FontWeight.Medium)
+                            Text(
+                                if (wfRecording) {
+                                    "Recording ${wfActiveName ?: "workflow"} · $wfStepCount step(s)"
+                                } else {
+                                    "Idle · ${workflows.size} saved"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        if (wfRecording) {
+                            OutlinedButton(onClick = {
+                                val wf = app.workflowRecorder.stop()
+                                val msg = if (wf != null) "Saved ${wf.steps.size} step(s)" else "Stopped"
+                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            }) { Text("Stop") }
+                        } else {
+                            FilledTonalButton(onClick = {
+                                runCatching { app.workflowRecorder.start() }
+                                    .onFailure { Toast.makeText(context, it.message ?: "Already recording", Toast.LENGTH_SHORT).show() }
+                            }) { Text("Start") }
+                        }
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Clip recording", fontWeight = FontWeight.Medium)
+                            val clipStatus = when {
+                                clipRecording -> "Recording now"
+                                clipReady -> "Ready"
+                                else -> "Not enabled"
+                            }
+                            Text("$clipStatus · ${clips.size} saved", style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (clipReady) {
+                            OutlinedButton(onClick = {
+                                runCatching { context.startService(ClipRecordingService.stopIntent(context)) }
+                                app.clipRecorder.releaseProjection()
+                            }) { Text("Stop session") }
+                        } else {
+                            FilledTonalButton(onClick = {
+                                context.startActivity(Intent(context, ClipConsentActivity::class.java))
+                            }) { Text("Enable clip recording") }
+                        }
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Shared links", fontWeight = FontWeight.Medium)
+                            Text(
+                                "${sharedItems.size} item(s) saved via Share → Save to Thumbs",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        OutlinedButton(enabled = sharedItems.isNotEmpty(), onClick = {
+                            app.sharedInbox.clear()
+                        }) { Text("Clear") }
                     }
                 }
             }
@@ -342,9 +437,9 @@ private fun MainScreen(app: ThumbsApp) {
     }
 
     if (showCreate) {
-        CreateKeyDialog(onDismiss = { showCreate = false }) { name, scope, validForMs ->
+        CreateKeyDialog(onDismiss = { showCreate = false }) { name, scope, validForMs, allowedPackages ->
             showCreate = false
-            created = app.keys.create(name, scope, validForMs)
+            created = app.keys.create(name, scope, validForMs, allowedPackages)
         }
     }
     created?.let { CreatedKeyDialog(it, url) { created = null } }
@@ -404,11 +499,17 @@ private fun SetupRow(done: Boolean, title: String, detail: String, action: Strin
 @Composable
 private fun KeyRow(key: ApiKey, onDelete: () -> Unit) {
     val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+    val scopeLabel = when (key.scope) {
+        Scope.CONTROL -> "Full control"
+        Scope.RESEARCH -> "Research"
+        Scope.READ -> "Read only"
+    }
+    val appSuffix = if (key.allowedPackages.isNotEmpty()) " · ${key.allowedPackages.size} allowed app(s)" else ""
     Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(key.name, fontWeight = FontWeight.Medium)
             Text(
-                "${if (key.scope == Scope.CONTROL) "Full control" else "Read only"} · ${key.prefix}… · " +
+                "$scopeLabel$appSuffix · ${key.prefix}… · " +
                     (key.lastUsedAt?.let { "used ${df.format(Date(it))}" } ?: "never used"),
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -507,25 +608,51 @@ private fun copy(context: Context, text: String, sensitive: Boolean) {
 }
 
 @Composable
-private fun CreateKeyDialog(onDismiss: () -> Unit, onCreate: (String, Scope, Long?) -> Unit) {
+private fun CreateKeyDialog(onDismiss: () -> Unit, onCreate: (String, Scope, Long?, List<String>) -> Unit) {
     var name by remember { mutableStateOf("") }
     var scope by remember { mutableStateOf(Scope.CONTROL) }
+    var allowedPackagesText by remember { mutableStateOf("") }
     var validity by remember { mutableIntStateOf(0) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("New API key") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name (e.g. laptop-claude)") }, singleLine = true)
                 Spacer(Modifier.size(12.dp))
                 RadioRow("Full control", scope == Scope.CONTROL) { scope = Scope.CONTROL }
+                RadioRow("Research (browse only; blocks send/post/pay/delete)", scope == Scope.RESEARCH) { scope = Scope.RESEARCH }
                 RadioRow("Read only (screen, UI tree, notifications)", scope == Scope.READ) { scope = Scope.READ }
+                if (scope != Scope.READ) {
+                    Spacer(Modifier.size(8.dp))
+                    OutlinedTextField(
+                        value = allowedPackagesText,
+                        onValueChange = { allowedPackagesText = it },
+                        label = { Text("Allowed app packages (optional, comma-separated)") },
+                        placeholder = { Text("com.zhiliaoapp.musically, com.twitter.android") },
+                        singleLine = false,
+                        maxLines = 3,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 Spacer(Modifier.size(12.dp))
                 Text("Expires", style = MaterialTheme.typography.labelMedium)
                 KEY_VALIDITY.forEachIndexed { i, (label, _) -> RadioRow(label, validity == i) { validity = i } }
             }
         },
-        confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { onCreate(name, scope, KEY_VALIDITY[validity].second) }) { Text("Create") } },
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotBlank(),
+                onClick = {
+                    val packages = if (scope == Scope.READ) {
+                        emptyList()
+                    } else {
+                        allowedPackagesText.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+                    }
+                    onCreate(name, scope, KEY_VALIDITY[validity].second, packages)
+                },
+            ) { Text("Create") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

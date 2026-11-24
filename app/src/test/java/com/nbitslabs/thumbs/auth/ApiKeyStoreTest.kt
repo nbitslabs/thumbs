@@ -74,4 +74,72 @@ class ApiKeyStoreTest {
         val tokens = (1..200).map { ApiKeyStore.generateToken() }.toSet()
         assertEquals(200, tokens.size)
     }
+
+    @Test fun `scope canControl reflects READ, RESEARCH and CONTROL`() {
+        assertFalse(Scope.READ.canControl)
+        assertTrue(Scope.RESEARCH.canControl)
+        assertTrue(Scope.CONTROL.canControl)
+    }
+
+    @Test fun `research scope and allowedPackages normalize and survive reload`() {
+        val file = File(tmp.root, "keys.json")
+        val s = store(file)
+        val created = s.create(
+            name = "researcher",
+            scope = Scope.RESEARCH,
+            allowedPackages = listOf("  com.twitter.android ", "", "   ", "com.zhiliaoapp.musically", "COM.TWITTER.ANDROID"),
+        )
+        assertEquals(Scope.RESEARCH, created.key.scope)
+        assertEquals(listOf("com.twitter.android", "com.zhiliaoapp.musically"), created.key.allowedPackages)
+
+        val reloaded = store(file)
+        val authed = reloaded.authenticate(created.token)
+        assertNotNull(authed)
+        assertEquals(Scope.RESEARCH, authed!!.scope)
+        assertEquals(listOf("com.twitter.android", "com.zhiliaoapp.musically"), authed.allowedPackages)
+    }
+
+    @Test fun `legacy json without allowedPackages deserializes cleanly`() {
+        val file = File(tmp.root, "keys.json")
+        val token = ApiKeyStore.generateToken()
+        val hash = ApiKeyStore.sha256(token)
+        file.writeText(
+            """
+            [
+              {
+                "id": "legacy-1",
+                "name": "old-laptop",
+                "prefix": "${token.take(13)}",
+                "hash": "$hash",
+                "scope": "CONTROL",
+                "createdAt": 1000
+              }
+            ]
+            """.trimIndent(),
+        )
+        val s = store(file)
+        val authed = s.authenticate(token)
+        assertNotNull(authed)
+        assertEquals("old-laptop", authed!!.name)
+        assertEquals(Scope.CONTROL, authed.scope)
+        assertEquals(emptyList<String>(), authed.allowedPackages)
+    }
+
+    @Test fun `isActive tracks existence, deletion and expiry`() {
+        var now = 10_000L
+        val s = ApiKeyStore(File(tmp.root, "keys.json")) { now }
+        val temp = s.create("temp", Scope.RESEARCH, validForMs = 5_000L)
+        val perm = s.create("perm", Scope.CONTROL)
+
+        assertTrue(s.isActive(temp.key.id))
+        assertTrue(s.isActive(perm.key.id))
+        assertFalse(s.isActive("missing-id"))
+
+        now += 5_000L
+        assertFalse(s.isActive(temp.key.id))
+        assertTrue(s.isActive(perm.key.id))
+
+        s.delete(perm.key.id)
+        assertFalse(s.isActive(perm.key.id))
+    }
 }

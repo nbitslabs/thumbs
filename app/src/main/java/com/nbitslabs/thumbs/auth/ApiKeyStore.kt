@@ -14,8 +14,14 @@ enum class Scope {
     /** Screenshots, UI tree, device state, notifications listing. */
     READ,
 
+    /** READ plus safe browsing and navigation within allowed apps; blocks risky actions and high-privilege tools. */
+    RESEARCH,
+
     /** Everything in READ plus input, app launching, intents, notification actions. */
     CONTROL,
+    ;
+
+    val canControl: Boolean get() = this == RESEARCH || this == CONTROL
 }
 
 @Serializable
@@ -31,6 +37,8 @@ data class ApiKey(
     val lastUsedAt: Long? = null,
     /** When set, the key stops working at this time. */
     val expiresAt: Long? = null,
+    /** Optional package allow-list; empty means all apps (except Thumbs itself). */
+    val allowedPackages: List<String> = emptyList(),
 ) {
     fun isExpired(now: Long) = expiresAt != null && now >= expiresAt
 }
@@ -50,16 +58,27 @@ class ApiKeyStore(private val file: File, private val clock: () -> Long = System
     // lastUsedAt is updated in memory on every request and flushed at most this often
     private var lastFlush = 0L
 
-    fun create(name: String, scope: Scope, validForMs: Long? = null): CreatedKey {
+    fun create(
+        name: String,
+        scope: Scope,
+        validForMs: Long? = null,
+        allowedPackages: List<String> = emptyList(),
+    ): CreatedKey {
         val token = generateToken()
+        val now = clock()
+        val normalizedPackages = allowedPackages
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
         val key = ApiKey(
             id = UUID.randomUUID().toString(),
             name = name.trim().ifEmpty { "Unnamed key" },
             prefix = token.take(TOKEN_PREFIX.length + 6),
             hash = sha256(token),
             scope = scope,
-            createdAt = clock(),
-            expiresAt = validForMs?.let { clock() + it },
+            createdAt = now,
+            expiresAt = validForMs?.let { now + it },
+            allowedPackages = normalizedPackages,
         )
         synchronized(lock) {
             _keys.value = _keys.value + key
@@ -71,6 +90,12 @@ class ApiKeyStore(private val file: File, private val clock: () -> Long = System
     fun delete(id: String) = synchronized(lock) {
         _keys.value = _keys.value.filterNot { it.id == id }
         save()
+    }
+
+    /** Returns true when a key with [id] exists and has not expired. */
+    fun isActive(id: String): Boolean {
+        val now = clock()
+        return synchronized(lock) { _keys.value.any { it.id == id && !it.isExpired(now) } }
     }
 
     /** Returns the key matching [token], or null (also when it has expired). Records usage time. */

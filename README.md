@@ -12,7 +12,8 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 
 ## Security model
 
-- **API keys.** Every request needs `Authorization: Bearer thumbs_…`. Create one key per computer or agent in the app; each key is either *Full control* or *Read only* (screen, UI tree, device state, notifications). Keys are 256-bit random tokens shown once; only their SHA-256 is stored, and they are excluded from backups. Revoking a key takes effect immediately, and a key can be created to expire after an hour, a day or 30 days.
+- **API keys.** Every request needs `Authorization: Bearer thumbs_…`. Create one key per computer or agent in the app; each key is *Full control*, *Research* (safe browsing/navigation that hard-blocks risky actions like send/post/pay/delete and high-privilege tools such as `start_intent` and notification actions), or *Read only* (screen, UI tree, device state, notifications). *Full control* and *Research* keys can optionally be restricted to a comma-separated list of allowed Android app packages. Keys are 256-bit random tokens shown once; only their SHA-256 is stored, and they are excluded from backups. Revoking a key takes effect immediately, and a key can be created to expire after an hour, a day or 30 days.
+- **Cooperative phone lease.** Control tools automatically acquire a 90-second idle lease for the active API key so multiple agents don't interleave gestures on the same screen. Agents can explicitly reserve or free the phone with `acquire_phone` / `release_phone`, and the owner can force-release the lease from the Server card.
 - **Network.** By default only Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback (for `adb forward`) are accepted. Tailscale encrypts the traffic (WireGuard), which is why plain HTTP is used. "Any network" can be enabled in settings; a key is still required.
 - **Browsers are rejected.** Requests carrying an `Origin` header are refused, which blocks DNS-rebinding attacks from web pages.
 - **Brute force.** An address is locked out for 5 minutes after 10 failed authentications.
@@ -26,13 +27,24 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 
 | Area | Tools |
 | --- | --- |
-| Observe (read-only keys) | `get_device_state`, `screenshot`, `read_screen_text`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
+| Observe (read-only keys) | `get_device_state`, `screenshot`, `capture_burst`, `read_screen_text`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
 | Touch | `tap`, `long_press`, `double_tap`, `swipe`, `scroll`, `drag`, `pinch`, `element_action` |
 | Text & keys | `type_text`, `press_key`, `set_clipboard`, `get_clipboard` |
 | Apps | `open_app`, `open_url`, `start_intent` |
 | Notifications | `open_notification`, `notification_action` (including inline replies), `dismiss_notification` |
 | Power | `wake_screen` (`press_key lock_screen` locks) |
+| Share-to-Thumbs | `get_shared_items` (read-only), `clear_shared_items` |
+| Workflow recording | `start_recording`, `stop_recording`, `list_recordings` (read-only), `get_recording` (read-only), `delete_recording` |
+| Clip recording | `record_clip`, `list_clips` (read-only), `delete_clip` (MP4 download via `GET /clips/<id>` with Bearer token) |
+| Phone lease | `acquire_phone`, `release_phone` |
 | Live view | `get_view_link` (read-only keys too) |
+
+Additional capabilities:
+
+- **Share-to-Thumbs.** Share links or text from any Android app via the system Share sheet (*Save to Thumbs*) into a local inbox that agents can read with `get_shared_items` (with extracted URLs).
+- **Storyboard burst (`capture_burst`).** Captures 2–12 timed screenshots into a single timestamped JPEG grid (`t+0.0s`, …) for inspecting animations or short videos without extra permissions.
+- **Clip recording (`record_clip`).** Records a bounded video-only MP4 screen clip (3–30 s) after the owner taps *Enable clip recording* in the Thumbs app (Android `MediaProjection` consent). Clips are downloaded over Tailscale from `GET /clips/<id>` using the same `Authorization: Bearer <key>` gate.
+- **Workflow recording.** Records a human's UI steps (app switches, taps, scrolls, redacted text inputs) via `start_recording` / `stop_recording` or the *Recorders & Inbox* card in the app; passwords and raw typed values are never stored.
 
 Conventions:
 

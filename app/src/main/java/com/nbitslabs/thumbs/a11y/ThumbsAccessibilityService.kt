@@ -73,6 +73,9 @@ class ThumbsAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
             -> lastUiEventAt = SystemClock.uptimeMillis()
         }
+        runCatching {
+            ThumbsApp.get(this).workflowRecorder.recordAccessibilityEvent(event, currentPackage())
+        }
     }
 
     override fun onInterrupt() {}

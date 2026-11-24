@@ -106,4 +106,51 @@ class McpServerTest {
         ) as JsonArray
         assertEquals(2, out.size)
     }
+
+    @Test fun `research keys see control tools except blocked tools and enforce them on call`() = runTest {
+        val policyTools = listOf(
+            Tool("get_device_state", "State", schema(), Scope.READ) { ToolResult.text("ok") },
+            Tool("tap", "Tap", schema(), Scope.CONTROL) { ToolResult.text("tapped") },
+            Tool("open_url", "Open URL", schema(), Scope.CONTROL) { ToolResult.text("opened") },
+            Tool("start_intent", "Intent", schema(), Scope.CONTROL) { ToolResult.text("started") },
+            Tool("notification_action", "Notif action", schema(), Scope.CONTROL) { ToolResult.text("acted") },
+            Tool("dismiss_notification", "Dismiss", schema(), Scope.CONTROL) { ToolResult.text("dismissed") },
+            Tool("open_notification", "Open notif", schema(), Scope.CONTROL) { ToolResult.text("opened") },
+        )
+        val policyAudits = mutableListOf<AuditEvent>()
+        val policyServer = McpServer({ policyTools }, "1.0", "be careful", policyAudits::add)
+        val research = ApiKey("3", "res", "thumbs_z", "h", Scope.RESEARCH, 0)
+        val researchNoBrowser = ApiKey("4", "res-nb", "thumbs_w", "h", Scope.RESEARCH, 0, allowedPackages = listOf("com.zhiliaoapp.musically"))
+
+        suspend fun listNames(key: ApiKey): List<String> =
+            Json.parseToJsonElement(policyServer.handle("""{"jsonrpc":"2.0","id":1,"method":"tools/list"}""", key)!!)
+                .jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
+                .map { it.jsonObject["name"]!!.jsonPrimitive.content }
+
+        assertEquals(listOf("get_device_state", "tap", "open_url"), listNames(research))
+        assertEquals(listOf("get_device_state", "tap"), listNames(researchNoBrowser))
+        assertEquals(listOf("get_device_state"), listNames(reader))
+
+        val tapRes = Json.parseToJsonElement(
+            policyServer.handle("""{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tap"}}""", research)!!,
+        ).jsonObject["result"]!!.jsonObject
+        assertFalse(tapRes["isError"]!!.jsonPrimitive.boolean)
+        assertEquals("tapped", tapRes["content"]!!.jsonArray[0].jsonObject["text"]!!.jsonPrimitive.content)
+
+        val blockedRes = Json.parseToJsonElement(
+            policyServer.handle("""{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_intent"}}""", research)!!,
+        ).jsonObject["result"]!!.jsonObject
+        assertTrue(blockedRes["isError"]!!.jsonPrimitive.boolean)
+        assertFalse(policyAudits.last().ok)
+
+        val blockedUrlRes = Json.parseToJsonElement(
+            policyServer.handle("""{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"open_url"}}""", researchNoBrowser)!!,
+        ).jsonObject["result"]!!.jsonObject
+        assertTrue(blockedUrlRes["isError"]!!.jsonPrimitive.boolean)
+
+        val roTapRes = Json.parseToJsonElement(
+            policyServer.handle("""{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tap"}}""", reader)!!,
+        ).jsonObject["result"]!!.jsonObject
+        assertTrue(roTapRes["isError"]!!.jsonPrimitive.boolean)
+    }
 }
