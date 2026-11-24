@@ -40,8 +40,9 @@ class TreeOptions(
     val includeInvisible: Boolean = false,
     val interestingOnly: Boolean = true,
     val maxNodes: Int = 600,
-    val maxTextLength: Int = 160,
+    val maxTextLength: Int = 2000,
     val includeSystemWindows: Boolean = true,
+    val compact: Boolean = false,
 )
 
 class UiSnapshot(val text: String, val nodeCount: Int, val truncated: Boolean)
@@ -65,7 +66,12 @@ object UiTree {
                 return
             }
             if (!options.includeInvisible && !node.isVisibleToUser) return
-            val printed = !options.interestingOnly || isInteresting(node)
+            if (isAccessibilityShortcutNode(node)) return
+            val printed = when {
+                options.compact -> isCompactInteresting(node)
+                options.interestingOnly -> isInteresting(node)
+                else -> true
+            }
             if (printed) {
                 count++
                 repeat(depth) { sb.append("  ") }
@@ -86,11 +92,11 @@ object UiTree {
             }
         } else {
             for (w in windows) {
+                // Skip accessibility overlays (both our own invisible overlays and Android's SystemUI floating shortcut)
+                if (w.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
                 if (!options.includeSystemWindows && w.type != AccessibilityWindowInfo.TYPE_APPLICATION && w.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
                 val root = w.root ?: continue
                 if (root.packageName?.toString() == service.packageName) {
-                    // Our own invisible overlays (keep-awake, confirmation prompts) aren't app UI
-                    if (w.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue
                     sb.append("## window app=").append(service.packageName).append(" (hidden: the Thumbs app can only be used by the person holding the phone)\n")
                     continue
                 }
@@ -135,11 +141,30 @@ object UiTree {
     /** At most this many meaningful nodes in an app window means the app hides its UI. */
     private const val OPAQUE_MAX_NODES = 2
 
+    private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+    private val ACCESSIBILITY_SHORTCUT_DESCS = setOf(
+        "thumbs remote control",
+        "tap a feature to start using it:",
+    )
+
+    /** True for Android's floating accessibility shortcut overlay nodes owned by SystemUI. */
+    fun isAccessibilityShortcutNode(node: AccessibilityNodeInfo): Boolean {
+        if (node.packageName?.toString() != SYSTEM_UI_PACKAGE) return false
+        val desc = node.contentDescription?.toString()?.trim()?.lowercase() ?: return false
+        return desc in ACCESSIBILITY_SHORTCUT_DESCS
+    }
+
     fun isInteresting(n: AccessibilityNodeInfo): Boolean =
         !n.text.isNullOrBlank() || !n.contentDescription.isNullOrBlank() || !n.hintText.isNullOrBlank() ||
             n.isClickable || n.isLongClickable || n.isEditable || n.isScrollable || n.isCheckable ||
             n.isFocused || n.isAccessibilityFocused || (n.isFocusable && n.viewIdResourceName != null) ||
             n.paneTitle != null
+
+    /** Compact filter: keeps labelled nodes and editable/checkable/selected/focused controls while folding away empty containers. */
+    fun isCompactInteresting(n: AccessibilityNodeInfo): Boolean =
+        !n.text.isNullOrBlank() || !n.contentDescription.isNullOrBlank() || !n.hintText.isNullOrBlank() ||
+            !n.paneTitle.isNullOrBlank() || n.isEditable || n.isCheckable || n.isSelected ||
+            n.isFocused || n.isAccessibilityFocused
 
     fun describe(n: AccessibilityNodeInfo, space: CoordinateSpace, screenRect: Rect, maxText: Int): String {
         val sb = StringBuilder()
@@ -176,15 +201,24 @@ object UiTree {
         return sb.toString()
     }
 
-    /** All visible nodes across windows, top-most window first. */
+    /** All visible nodes across windows, top-most window first, excluding accessibility overlays. */
     fun allNodes(service: ThumbsAccessibilityService, includeInvisible: Boolean = false): Sequence<AccessibilityNodeInfo> = sequence {
-        for (root in service.roots()) {
+        val windows = service.orderedWindows()
+        val roots = if (windows.isNotEmpty()) {
+            windows
+                .filter { it.type != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY }
+                .mapNotNull { it.root }
+        } else {
+            listOfNotNull(service.rootInActiveWindow)
+        }
+        for (root in roots) {
             if (root.packageName?.toString() == service.packageName) continue
             val stack = ArrayDeque<AccessibilityNodeInfo>()
             stack.addLast(root)
             while (stack.isNotEmpty()) {
                 val n = stack.removeLast()
                 if (!includeInvisible && !n.isVisibleToUser) continue
+                if (isAccessibilityShortcutNode(n)) continue
                 yield(n)
                 for (i in n.childCount - 1 downTo 0) n.getChild(i)?.let(stack::addLast)
             }

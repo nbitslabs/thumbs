@@ -28,7 +28,7 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 | Area | Tools |
 | --- | --- |
 | Observe (read-only keys) | `get_device_state`, `screenshot`, `capture_burst`, `read_screen_text`, `get_ui_tree`, `find_elements`, `wait_for`, `wait_for_idle`, `list_apps`, `list_notifications` |
-| Touch | `tap`, `long_press`, `double_tap`, `swipe`, `scroll`, `drag`, `pinch`, `element_action` |
+| Touch | `tap`, `long_press`, `double_tap`, `swipe`, `scroll`, `scroll_and_collect`, `drag`, `pinch`, `element_action` |
 | Text & keys | `type_text`, `press_key`, `set_clipboard`, `get_clipboard` |
 | Apps | `open_app`, `open_url`, `start_intent` |
 | Notifications | `open_notification`, `notification_action` (including inline replies), `dismiss_notification` |
@@ -42,7 +42,10 @@ It runs entirely on the phone: an accessibility service does the seeing and touc
 Additional capabilities:
 
 - **Share-to-Thumbs.** Share links or text from any Android app via the system Share sheet (*Save to Thumbs*) into a local inbox that agents can read with `get_shared_items` (with extracted URLs).
-- **Storyboard burst (`capture_burst`).** Captures 2–12 timed screenshots into a single timestamped JPEG grid (`t+0.0s`, …) for inspecting animations or short videos without extra permissions.
+- **Feed sweep (`scroll_and_collect`).** Scrolls an active social or list feed for 1–12 steps in one call, strips repetitive social UI chrome, deduplicates overlapping items across screens, and collects distinct `http(s)` URLs.
+- **Compact & full-text UI tree (`get_ui_tree`).** Defaults to 2000-character element text (`max_text_length`) so full posts aren't cut off, hides Android's floating accessibility shortcut overlay, and supports `compact: true` to fold away unlabelled containers.
+- **Native-resolution chart/element zoom (`screenshot`).** Pass `ref` or `x1,y1,x2,y2` to crop directly from the unscaled native screen bitmap (capped at 1568 px long edge) for reading dense charts, tables, and small image details.
+- **Storyboard burst (`capture_burst`).** Captures 2–12 timed screenshots into a single timestamped JPEG grid (`t+0.0s`, …) for inspecting animations or short videos without extra permissions. Supports `crop_bars` (default `true`, trims status and navigation bars) and `skip_static` (default `false`, skips identical/paused consecutive frames).
 - **Clip recording (`record_clip`).** Records a bounded video-only MP4 screen clip (3–30 s) after the owner taps *Enable clip recording* in the Thumbs app (Android `MediaProjection` consent). Clips are downloaded over Tailscale from `GET /clips/<id>` using the same `Authorization: Bearer <key>` gate.
 - **Workflow recording.** Records a human's UI steps (app switches, taps, scrolls, redacted text inputs) via `start_recording` / `stop_recording` or the *Recorders & Inbox* card in the app; passwords and raw typed values are never stored.
 

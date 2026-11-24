@@ -18,6 +18,8 @@ import com.nbitslabs.thumbs.Settings
 import com.nbitslabs.thumbs.auth.Scope
 import com.nbitslabs.thumbs.a11y.BurstCapture
 import com.nbitslabs.thumbs.a11y.CoordinateSpace
+import com.nbitslabs.thumbs.a11y.FeedCollector
+import com.nbitslabs.thumbs.a11y.FeedDeduplicator
 import com.nbitslabs.thumbs.a11y.Gestures
 import com.nbitslabs.thumbs.a11y.ScreenText
 import com.nbitslabs.thumbs.a11y.ScreenTextItem
@@ -73,7 +75,7 @@ class PhoneTools(
     val instructions = """
         Thumbs controls an Android phone through its accessibility service.
 
-        Workflow: call get_ui_tree (cheap, text) or screenshot (visual) to see the screen, act with tap/type_text/scroll/press_key/open_app, then verify. Taps on empty space "succeed" silently, so always check the result; control tools accept observe="tree"|"screenshot"|"both" to get the new state back immediately.
+        Workflow: call get_ui_tree (cheap, text; pass compact=true to cut container noise) or screenshot (visual; pass ref or x1,y1,x2,y2 to zoom/crop charts or images at native resolution) to see the screen, act with tap/type_text/scroll/press_key/open_app, then verify. For fast social or list sweeps, use scroll_and_collect to scroll multiple pages and return deduplicated feed text and URLs in one call. Taps on empty space "succeed" silently, so always check the result; control tools accept observe="tree"|"screenshot"|"both" to get the new state back immediately.
 
         Apps that draw their own UI (WeChat, games, some Flutter/Unity apps) show almost nothing in get_ui_tree; use screenshot or read_screen_text (OCR, with tappable bounds) there, and tap by x/y or text (text targets fall back to OCR).
 
@@ -120,17 +122,52 @@ class PhoneTools(
 
         Tool(
             name = "screenshot",
-            description = "Capture the screen as an image in the coordinate space (points in it can be passed to tap). Secure screens (FLAG_SECURE) can't be captured; use get_ui_tree for those.",
+            description = "Capture the screen as an image in the coordinate space (points in it can be passed to tap). Pass ref or x1,y1,x2,y2 to zoom/crop a region directly from the full native resolution image (ideal for benchmark charts, tables, or dense images). Secure screens (FLAG_SECURE) can't be captured; use get_ui_tree for those.",
             inputSchema = schema {
                 string("format", "Image format (default jpeg).", enum = listOf("jpeg", "png"))
                 integer("quality", "JPEG quality 10-100 (default 75).")
                 boolean("include_tree", "Also return the UI tree as text (default false).")
+                string("ref", "Zoom/crop to this element ref from get_ui_tree at full native resolution (great for benchmark charts/tables).")
+                number("x1", "Optional crop region left in coordinate space.")
+                number("y1", "Optional crop region top in coordinate space.")
+                number("x2", "Optional crop region right in coordinate space.")
+                number("y2", "Optional crop region bottom in coordinate space.")
             },
             scope = Scope.READ,
         ) { call ->
             val svc = looking()
+            val format = call.string("format") ?: "jpeg"
+            val quality = call.int("quality") ?: 75
+            val ref = call.string("ref")?.trim()?.takeIf { it.isNotEmpty() }
+            val hasBox = call.has("x1") || call.has("y1") || call.has("x2") || call.has("y2")
+            if (ref != null && hasBox) {
+                throw ToolException("Specify either ref or x1,y1,x2,y2 to crop, not both.")
+            }
             val content = mutableListOf<Content>()
-            content += screenshotContent(svc, call.string("format") ?: "jpeg", call.int("quality") ?: 75)
+            if (ref != null) {
+                val node = UiTree.resolveRef(ref)
+                val bounds = boundsOf(node)
+                if (bounds.isEmpty) throw ToolException("Element '$ref' has no visible area; scroll it into view first.")
+                content += croppedScreenshotContent(svc, format, quality, bounds, "element $ref")
+            } else if (hasBox) {
+                val x1 = call.requireDouble("x1")
+                val y1 = call.requireDouble("y1")
+                val x2 = call.requireDouble("x2")
+                val y2 = call.requireDouble("y2")
+                if (!x1.isFinite() || !y1.isFinite() || !x2.isFinite() || !y2.isFinite() || x2 <= x1 || y2 <= y1) {
+                    throw ToolException("The crop region is empty or inverted; give finite x1,y1 (top-left) and x2,y2 (bottom-right) with x1 < x2 and y1 < y2.")
+                }
+                val sp = space()
+                val bounds = Rect(
+                    (x1 / sp.scale).toInt(),
+                    (y1 / sp.scale).toInt(),
+                    (x2 / sp.scale).toInt(),
+                    (y2 / sp.scale).toInt(),
+                )
+                content += croppedScreenshotContent(svc, format, quality, bounds, "region")
+            } else {
+                content += screenshotContent(svc, format, quality)
+            }
             if (call.bool("include_tree") == true) content += Content.Text(UiTree.snapshot(svc, space()).text)
             ToolResult(content)
         },
@@ -143,10 +180,18 @@ class PhoneTools(
                 boolean("include_invisible", "Include nodes not visible to the user (default false).")
                 boolean("app_only", "Skip system windows such as the status bar (default false).")
                 integer("max_nodes", "Maximum elements to return (default 600).")
+                boolean("compact", "Fold away unlabelled containers to cut noise by ~50% (default false).")
+                integer("max_text_length", "Max characters per element text/desc (default 2000; 0 or >=2000 for full tweets/captions).")
             },
             scope = Scope.READ,
         ) { call ->
             val svc = looking(wake = false)
+            val rawMaxText = call.int("max_text_length")
+            val maxTextLength = when {
+                rawMaxText == null -> 2000
+                rawMaxText <= 0 -> 10000
+                else -> rawMaxText.coerceIn(40, 10000)
+            }
             val snap = UiTree.snapshot(
                 svc,
                 space(),
@@ -154,7 +199,9 @@ class PhoneTools(
                     includeInvisible = call.bool("include_invisible") == true,
                     interestingOnly = call.bool("all_nodes") != true,
                     maxNodes = (call.int("max_nodes") ?: 600).coerceIn(10, 5000),
+                    maxTextLength = maxTextLength,
                     includeSystemWindows = call.bool("app_only") != true,
+                    compact = call.bool("compact") == true,
                 ),
             )
             ToolResult.text(header(svc) + "\n" + snap.text.ifBlank { "(no accessible windows; the screen may be off or showing a secure surface)" })
@@ -386,6 +433,31 @@ class PhoneTools(
             },
             scope = Scope.CONTROL,
         ) { call -> scroll(call) },
+
+        Tool(
+            name = "scroll_and_collect",
+            description = "Scroll the active feed for several pages in one call, stripping social UI chrome, deduplicating overlapping posts/items across screens, and extracting distinct URLs.",
+            inputSchema = schema {
+                integer("steps", "Number of scroll steps to collect (default 5, max 12).")
+                string("direction", "Content direction to reveal: down (default), up, left, right.", enum = listOf("down", "up", "left", "right"))
+                number("amount", "Fraction of screen per scroll, 0.3-0.9 (default 0.72).")
+                integer("settle_ms", "Wait after each scroll in ms, 250-2500 (default 700).")
+            },
+            scope = Scope.CONTROL,
+        ) { call ->
+            val svc = ready(call)
+            val pkg = svc.currentPackage()
+            val fgLabel = pkg?.let { p -> Apps.label(context, p)?.let { "$it ($p)" } ?: p }
+            val feed = FeedCollector.scrollAndCollect(
+                svc = svc,
+                space = space(),
+                steps = call.int("steps") ?: 5,
+                direction = call.string("direction") ?: "down",
+                amount = call.double("amount") ?: 0.72,
+                settleMs = (call.int("settle_ms") ?: 700).toLong(),
+            )
+            ToolResult.text(FeedDeduplicator.format(feed, fgLabel))
+        },
 
         Tool(
             name = "drag",
@@ -714,6 +786,8 @@ class PhoneTools(
                 integer("frames", "Number of frames to capture, 2-12 (default 6).")
                 integer("interval_ms", "Milliseconds between frames, 400-3000 (default 600).")
                 integer("quality", "JPEG quality, 30-95 (default 70).")
+                boolean("crop_bars", "Crop Android status and nav bars off tiles (default true).")
+                boolean("skip_static", "Skip identical/paused consecutive frames (default false).")
             },
             scope = Scope.READ,
         ) { call ->
@@ -723,10 +797,13 @@ class PhoneTools(
                 frames = call.int("frames") ?: 6,
                 intervalMs = (call.int("interval_ms") ?: 600).toLong(),
                 quality = call.int("quality") ?: 70,
+                cropBars = call.bool("crop_bars") != false,
+                skipStatic = call.bool("skip_static") == true,
             )
             val b64 = Base64.encodeToString(burst.jpeg, Base64.NO_WRAP)
             val stamps = burst.timestampsMs.joinToString(", ") { String.format(Locale.US, "t+%.1fs", it / 1000.0) }
-            val summary = "Captured ${burst.framesCaptured} frames in a ${burst.columns}x${burst.rows} grid over ${burst.durationMs}ms ($stamps).\n${header(svc)}"
+            val skippedNote = if (burst.skippedStaticFrames > 0) " (skipped ${burst.skippedStaticFrames} static frame(s))" else ""
+            val summary = "Captured ${burst.framesCaptured} frames in a ${burst.columns}x${burst.rows} grid over ${burst.durationMs}ms ($stamps)$skippedNote.\n${header(svc)}"
             ToolResult(listOf(Content.Image(b64, "image/jpeg"), Content.Text(summary)))
         },
 
@@ -1255,6 +1332,69 @@ class PhoneTools(
         }
     }
 
+    /**
+     * Crops [screenRegion] (in raw native screen pixels) directly from the unscaled screenshot so
+     * dense charts, tables, and images keep full native sharpness, capped at [CoordinateSpace.MAX_LONG_EDGE].
+     */
+    private suspend fun croppedScreenshotContent(
+        svc: ThumbsAccessibilityService,
+        format: String,
+        quality: Int,
+        screenRegion: Rect,
+        regionLabel: String,
+    ): List<Content> {
+        val raw = capture(svc)
+        return try {
+            withContext(Dispatchers.Default) {
+                var cropped: Bitmap? = null
+                var output: Bitmap? = null
+                try {
+                    val left = screenRegion.left.coerceIn(0, raw.width)
+                    val top = screenRegion.top.coerceIn(0, raw.height)
+                    val right = screenRegion.right.coerceIn(0, raw.width)
+                    val bottom = screenRegion.bottom.coerceIn(0, raw.height)
+                    val cropW = right - left
+                    val cropH = bottom - top
+                    if (cropW <= 0 || cropH <= 0) {
+                        throw ToolException("The crop region falls outside the ${raw.width}x${raw.height} screen or is empty.")
+                    }
+
+                    val cropBmp = Bitmap.createBitmap(raw, left, top, cropW, cropH)
+                    cropped = cropBmp
+                    val maxEdge = maxOf(cropW, cropH)
+                    val outBmp = if (maxEdge > CoordinateSpace.MAX_LONG_EDGE) {
+                        val ratio = CoordinateSpace.MAX_LONG_EDGE.toDouble() / maxEdge.toDouble()
+                        val dstW = (cropW * ratio).toInt().coerceAtLeast(1)
+                        val dstH = (cropH * ratio).toInt().coerceAtLeast(1)
+                        Bitmap.createScaledBitmap(cropBmp, dstW, dstH, true)
+                    } else {
+                        cropBmp
+                    }
+                    output = outBmp
+
+                    val black = isBlank(outBmp)
+                    val out = ByteArrayOutputStream()
+                    val png = format == "png"
+                    outBmp.compress(if (png) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 100), out)
+                    val sp = CoordinateSpace.forScreen(raw.width, raw.height)
+                    val spaceRect = sp.fromScreen(Rect(left, top, right, bottom))
+                    val info = "Cropped $regionLabel: native ${cropW}x$cropH px (output ${outBmp.width}x${outBmp.height} px) " +
+                        "at screen @${left},${top},${right},${bottom} (space @${spaceRect.left},${spaceRect.top},${spaceRect.right},${spaceRect.bottom})."
+                    listOfNotNull(
+                        Content.Image(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP), if (png) "image/png" else "image/jpeg"),
+                        Content.Text(info),
+                        if (black) Content.Text(BLACK_SCREEN_NOTE) else null,
+                    )
+                } finally {
+                    if (output != null && output !== cropped && !output.isRecycled) output.recycle()
+                    if (cropped != null && cropped !== raw && !cropped.isRecycled) cropped.recycle()
+                }
+            }
+        } finally {
+            if (!raw.isRecycled) raw.recycle()
+        }
+    }
+
     /** True when (nearly) every sampled pixel is black. */
     private fun isBlank(b: Bitmap): Boolean {
         val stepX = maxOf(1, b.width / 24)
@@ -1293,7 +1433,7 @@ class PhoneTools(
 
         /** UI control tools that operate on the foreground app and must satisfy AppPolicy.checkForegroundApp. */
         val FOREGROUND_GUARDED_TOOLS = setOf(
-            "tap", "long_press", "double_tap", "swipe", "scroll", "drag", "pinch",
+            "tap", "long_press", "double_tap", "swipe", "scroll", "scroll_and_collect", "drag", "pinch",
             "element_action", "type_text", "set_clipboard", "get_clipboard",
         )
 

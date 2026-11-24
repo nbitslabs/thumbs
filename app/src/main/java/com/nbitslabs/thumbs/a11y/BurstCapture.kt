@@ -26,6 +26,7 @@ object BurstCapture {
         val rows: Int,
         val durationMs: Long,
         val timestampsMs: List<Long>,
+        val skippedStaticFrames: Int = 0,
     ) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -35,7 +36,8 @@ object BurstCapture {
                 columns == other.columns &&
                 rows == other.rows &&
                 durationMs == other.durationMs &&
-                timestampsMs == other.timestampsMs
+                timestampsMs == other.timestampsMs &&
+                skippedStaticFrames == other.skippedStaticFrames
         }
 
         override fun hashCode(): Int {
@@ -45,6 +47,7 @@ object BurstCapture {
             result = 31 * result + rows
             result = 31 * result + durationMs.hashCode()
             result = 31 * result + timestampsMs.hashCode()
+            result = 31 * result + skippedStaticFrames
             return result
         }
     }
@@ -58,6 +61,10 @@ object BurstCapture {
     private const val MIN_TILE_WIDTH = 180
     private const val MAX_TILE_WIDTH = 480
     private const val PADDING_PX = 8
+    private const val MIN_CROP_HEIGHT = 400
+    private const val STATUS_BAR_CROP_RATIO = 0.045f
+    private const val NAV_BAR_CROP_RATIO = 0.035f
+    private const val STATIC_DIFF_THRESHOLD = 2.5
 
     suspend fun captureStoryboard(
         svc: ThumbsAccessibilityService,
@@ -65,6 +72,8 @@ object BurstCapture {
         intervalMs: Long = 600L,
         quality: Int = 70,
         maxTileWidth: Int = 360,
+        cropBars: Boolean = true,
+        skipStatic: Boolean = false,
     ): BurstResult {
         val count = frames.coerceIn(MIN_FRAMES, MAX_FRAMES)
         val stepMs = intervalMs.coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
@@ -73,6 +82,8 @@ object BurstCapture {
 
         val tiles = ArrayList<Bitmap>(count)
         val timestamps = ArrayList<Long>(count)
+        var skippedStaticFrames = 0
+        var lastElapsedMs = 0L
         var sheet: Bitmap? = null
 
         try {
@@ -89,13 +100,27 @@ object BurstCapture {
                 try {
                     val capturedAt = SystemClock.uptimeMillis()
                     if (i == 0) firstFrameAt = capturedAt
-                    timestamps += (capturedAt - firstFrameAt).coerceAtLeast(0L)
-                    withContext(Dispatchers.Default) {
-                        scaled = downscale(raw, tileMaxWidth)
+                    val elapsedMs = (capturedAt - firstFrameAt).coerceAtLeast(0L)
+                    lastElapsedMs = elapsedMs
+
+                    val keep = withContext(Dispatchers.Default) {
+                        val candidate = cropAndDownscale(raw, tileMaxWidth, cropBars)
+                        scaled = candidate
+                        if (!skipStatic || tiles.isEmpty()) {
+                            true
+                        } else {
+                            meanChannelDiff(tiles.last(), candidate) >= STATIC_DIFF_THRESHOLD
+                        }
                     }
-                    scaled?.let {
-                        tiles += it
-                        scaled = null
+
+                    if (keep) {
+                        scaled?.let {
+                            tiles += it
+                            timestamps += elapsedMs
+                            scaled = null
+                        }
+                    } else {
+                        skippedStaticFrames++
                     }
                 } finally {
                     if (!raw.isRecycled) raw.recycle()
@@ -103,8 +128,13 @@ object BurstCapture {
                 }
             }
 
-            val cols = if (count <= 4) 2 else 3
-            val rows = (count + cols - 1) / cols
+            val kept = tiles.size
+            val cols = when {
+                kept <= 1 -> 1
+                kept <= 4 -> 2
+                else -> 3
+            }
+            val rows = (kept + cols - 1) / cols
             val jpeg = withContext(Dispatchers.Default) {
                 val stitched = stitchStoryboard(tiles, timestamps, cols, rows)
                 sheet = stitched
@@ -115,11 +145,12 @@ object BurstCapture {
 
             return BurstResult(
                 jpeg = jpeg,
-                framesCaptured = tiles.size,
+                framesCaptured = kept,
                 columns = cols,
                 rows = rows,
-                durationMs = timestamps.lastOrNull() ?: 0L,
+                durationMs = lastElapsedMs,
                 timestampsMs = timestamps.toList(),
+                skippedStaticFrames = skippedStaticFrames,
             )
         } finally {
             sheet?.let { if (!it.isRecycled) it.recycle() }
@@ -129,13 +160,62 @@ object BurstCapture {
         }
     }
 
-    private fun downscale(raw: Bitmap, maxWidth: Int): Bitmap {
-        if (raw.width <= maxWidth) {
-            return Bitmap.createBitmap(raw)
+    private fun cropAndDownscale(raw: Bitmap, maxWidth: Int, cropBars: Boolean): Bitmap {
+        var cropped: Bitmap? = null
+        return try {
+            val source = if (cropBars && raw.height > MIN_CROP_HEIGHT) {
+                val top = (raw.height * STATUS_BAR_CROP_RATIO).toInt().coerceAtLeast(0)
+                val bottom = (raw.height * NAV_BAR_CROP_RATIO).toInt().coerceAtLeast(0)
+                val croppedH = (raw.height - top - bottom).coerceAtLeast(1)
+                Bitmap.createBitmap(raw, 0, top, raw.width, croppedH).also { cropped = it }
+            } else {
+                raw
+            }
+            if (source.width <= maxWidth) {
+                val existing = cropped
+                if (existing != null) {
+                    cropped = null
+                    existing
+                } else {
+                    Bitmap.createBitmap(source)
+                }
+            } else {
+                val targetH = ((source.height.toLong() * maxWidth) / source.width).toInt().coerceAtLeast(1)
+                val scaled = Bitmap.createScaledBitmap(source, maxWidth, targetH, true)
+                if (scaled === source) Bitmap.createBitmap(source) else scaled
+            }
+        } finally {
+            cropped?.let { if (!it.isRecycled) it.recycle() }
         }
-        val targetH = ((raw.height.toLong() * maxWidth) / raw.width).toInt().coerceAtLeast(1)
-        val scaled = Bitmap.createScaledBitmap(raw, maxWidth, targetH, true)
-        return if (scaled === raw) Bitmap.createBitmap(raw) else scaled
+    }
+
+    /**
+     * Mean absolute per-channel RGB difference (0.0..255.0) across a fast grid sample.
+     * Returns 255.0 when dimensions differ (e.g. mid-burst rotation).
+     */
+    private fun meanChannelDiff(a: Bitmap, b: Bitmap): Double {
+        if (a.width != b.width || a.height != b.height || a.width <= 0 || a.height <= 0) return 255.0
+        val stepX = maxOf(1, a.width / 16)
+        val stepY = maxOf(1, a.height / 24)
+        var sumDiff = 0L
+        var samples = 0
+        var y = stepY / 2
+        while (y < a.height) {
+            var x = stepX / 2
+            while (x < a.width) {
+                val pa = a.getPixel(x, y)
+                val pb = b.getPixel(x, y)
+                val dr = kotlin.math.abs(((pa shr 16) and 0xFF) - ((pb shr 16) and 0xFF))
+                val dg = kotlin.math.abs(((pa shr 8) and 0xFF) - ((pb shr 8) and 0xFF))
+                val db = kotlin.math.abs((pa and 0xFF) - (pb and 0xFF))
+                sumDiff += (dr + dg + db)
+                samples++
+                x += stepX
+            }
+            y += stepY
+        }
+        if (samples == 0) return 255.0
+        return sumDiff.toDouble() / (samples * 3.0)
     }
 
     private fun stitchStoryboard(
@@ -166,7 +246,7 @@ object BurstCapture {
             this.textSize = textSize
         }
         val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(196, 12, 12, 16)
+            color = 0xFF121212.toInt()
             style = Paint.Style.FILL
         }
 

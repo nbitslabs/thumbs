@@ -59,9 +59,9 @@ class ThumbsAccessibilityService : AccessibilityService() {
                 lastUiEventAt = SystemClock.uptimeMillis()
                 val pkg = event.packageName?.toString()
                 val cls = event.className?.toString()
-                // Ignore transient system UI (toasts, IME) so "current app" means the app in front
+                // Ignore transient system UI (toasts, IME, generic views) so "current app" means the app in front
                 if (pkg != null && pkg != packageName && cls != null && !cls.startsWith("android.widget.") &&
-                    !cls.startsWith("android.inputmethodservice.")
+                    !cls.startsWith("android.inputmethodservice.") && !cls.startsWith("android.view.")
                 ) {
                     foregroundPackage = pkg
                     foregroundClass = cls
